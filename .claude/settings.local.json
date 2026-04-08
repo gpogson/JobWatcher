@@ -1,0 +1,12 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(pip install:*)",
+      "Bash(python -c \"import jobspy, requests, schedule, dotenv; print\\('All imports OK'\\)\")",
+      "Bash(python watcher.py)",
+      "Bash(pip3 install:*)",
+      "Bash(xcode-select -p)",
+      "Bash(git --version)"
+    ]
+  }
+}

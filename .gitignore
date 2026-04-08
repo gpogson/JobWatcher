@@ -1,0 +1,15 @@
+# secrets
+.env
+
+# runtime cache files (personal data, no need to share)
+seen_jobs.json
+company_cache.json
+revenue_cache.json
+apollo_cache.json
+pdl_cache.json
+watcher.log
+
+# python
+__pycache__/
+*.pyc
+*.pyo

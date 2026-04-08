@@ -1,0 +1,652 @@
+"""
+JobWatcher — NetSuite prospect signal monitor
+Searches job boards for finance leadership hires that signal ERP pain.
+Uses OpenAI to evaluate each posting rather than hardcoded keyword rules.
+"""
+
+import json
+import os
+import time
+import logging
+import warnings
+import urllib3
+from datetime import datetime, timezone, timedelta
+from pathlib import Path
+
+warnings.filterwarnings("ignore", category=DeprecationWarning)
+warnings.filterwarnings("ignore", category=ResourceWarning)
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+import requests
+import schedule
+from dotenv import load_dotenv
+from jobspy import scrape_jobs
+from openai import OpenAI
+
+# ---------------------------------------------------------------------------
+# Config
+# ---------------------------------------------------------------------------
+
+load_dotenv()
+
+DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL")
+if not DISCORD_WEBHOOK_URL:
+    raise RuntimeError("DISCORD_WEBHOOK_URL not set in .env")
+
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+if not OPENAI_API_KEY:
+    raise RuntimeError("OPENAI_API_KEY not set in .env")
+
+SERPER_API_KEY = os.getenv("SERPER_API_KEY")
+if not SERPER_API_KEY:
+    raise RuntimeError("SERPER_API_KEY not set in .env")
+
+openai_client = OpenAI(api_key=OPENAI_API_KEY)
+
+SEEN_FILE           = Path(__file__).parent / "seen_jobs.json"
+COMPANY_CACHE_FILE  = Path(__file__).parent / "company_cache.json"
+LOG_FILE            = Path(__file__).parent / "watcher.log"
+DIGEST_FILE         = Path(__file__).parent / "digest_log.json"
+
+# Maximum estimated company revenue to alert on (millions USD).
+# Companies confirmed over this are skipped. Unknown revenue passes through.
+MAX_REVENUE_MILLION = 15
+
+# Search every N hours
+SEARCH_INTERVAL_HOURS = 4
+HOURS_OLD = SEARCH_INTERVAL_HOURS + 1
+
+# US states to search
+US_LOCATIONS = [
+    "Washington State", "Oregon", "Idaho", "Montana",
+    "North Dakota", "South Dakota", "Minnesota", "Nebraska",
+    "Kansas", "Oklahoma", "Colorado", "Wyoming", "New Mexico",
+    "Arizona", "Utah", "Nevada", "California", "Alaska", "Hawaii",
+]
+
+# Canadian provinces to search
+CA_LOCATIONS = [
+    "Yukon", "Northwest Territories", "British Columbia",
+    "Alberta", "Saskatchewan",
+]
+
+# ---------------------------------------------------------------------------
+# Logging
+# ---------------------------------------------------------------------------
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s  %(levelname)-8s %(message)s",
+    handlers=[
+        logging.FileHandler(LOG_FILE),
+        logging.StreamHandler(),
+    ],
+)
+log = logging.getLogger("jobwatcher")
+
+# ---------------------------------------------------------------------------
+# Deduplication
+# ---------------------------------------------------------------------------
+
+def load_seen() -> set:
+    if SEEN_FILE.exists():
+        try:
+            return set(json.loads(SEEN_FILE.read_text()))
+        except (json.JSONDecodeError, OSError):
+            pass
+    return set()
+
+
+def save_seen(seen: set) -> None:
+    SEEN_FILE.write_text(json.dumps(sorted(seen), indent=2))
+
+
+def job_id(row) -> str:
+    """Primary dedupe key — board native ID or URL."""
+    jid = str(row.get("id") or "").strip()
+    if jid and jid != "nan":
+        return jid
+    url = str(row.get("job_url") or "").strip()
+    return url or f"{row.get('company','?')}|{row.get('title','?')}"
+
+
+def company_title_key(row) -> str:
+    """Secondary dedupe key — catches same posting returned by multiple location searches."""
+    company = str(row.get("company") or "").strip().lower()
+    title   = str(row.get("title") or "").strip().lower()
+    return f"{company}|{title}"
+
+
+# ---------------------------------------------------------------------------
+# Pre-filter: staffing firm blocklist (runs before AI — zero cost)
+# ---------------------------------------------------------------------------
+
+# Known staffing/recruiting firm names (lowercase, partial match)
+STAFFING_FIRM_NAMES = {
+    "robert half", "kforce", "randstad", "vaco", "cybercoders", "michael page",
+    "heidrick", "spencer stuart", "korn ferry", "lhh", "adecco", "manpower",
+    "staffmark", "aerotek", "insight global", "beacon hill", "parker lynch",
+    "creative financial staffing", "cfs", "ledgent", "roth staffing",
+    "accountingfly", "staffers", "hirenetworks", "tatum", "scion",
+    "venteon", "brilliant financial", "versique", "lancesoft", "apex systems",
+    "staffing solutions", "the select group", "naviga", "sanford rose",
+}
+
+# Red-flag words in company name that strongly indicate a recruiter
+STAFFING_NAME_KEYWORDS = [
+    "staffing", "recruiting", "recruitment", "headhunter", "search group",
+    "search partners", "executive search", "talent acquisition", "talent solutions",
+    "workforce solutions", "placement", "temp agency", "contract staffing",
+]
+
+# Red-flag phrases in the job description body
+STAFFING_DESCRIPTION_PHRASES = [
+    "our client is", "our client has", "on behalf of our client",
+    "our client, a", "confidential client", "our client company",
+    "working with a client", "placed at our client", "client of ours",
+]
+
+
+def is_staffing_firm(company: str, description: str) -> bool:
+    """Returns True if the posting is from a recruiter or staffing agency."""
+    co = company.lower()
+    desc = description.lower()
+
+    # Exact known firm match
+    for firm in STAFFING_FIRM_NAMES:
+        if firm in co:
+            return True
+
+    # Red-flag keyword in company name
+    for kw in STAFFING_NAME_KEYWORDS:
+        if kw in co:
+            return True
+
+    # Hidden client language in description
+    for phrase in STAFFING_DESCRIPTION_PHRASES:
+        if phrase in desc:
+            return True
+
+    return False
+
+# ---------------------------------------------------------------------------
+# Company enrichment (Serper → OpenAI)
+# Returns: revenue_millions (float), employees (int), website (str)
+# AI is never allowed to say unknown — it must always make a best guess.
+# ---------------------------------------------------------------------------
+
+def load_company_cache() -> dict:
+    if COMPANY_CACHE_FILE.exists():
+        try:
+            return json.loads(COMPANY_CACHE_FILE.read_text())
+        except (json.JSONDecodeError, OSError):
+            pass
+    return {}
+
+
+def save_company_cache(cache: dict) -> None:
+    COMPANY_CACHE_FILE.write_text(json.dumps(cache, indent=2))
+
+
+_company_cache: dict = load_company_cache()
+
+
+def serper_search(query: str) -> list[str]:
+    """Run a Google search via Serper and return a list of result snippets."""
+    try:
+        r = requests.post(
+            "https://google.serper.dev/search",
+            headers={"X-API-KEY": SERPER_API_KEY, "Content-Type": "application/json"},
+            json={"q": query, "num": 10},
+            timeout=10,
+        )
+        r.raise_for_status()
+        data = r.json()
+        snippets = []
+        for item in data.get("organic", []):
+            title   = item.get("title", "")
+            snippet = item.get("snippet", "")
+            link    = item.get("link", "")
+            snippets.append(f"{title}\n{snippet}\n{link}")
+        if data.get("knowledgeGraph"):
+            kg = data["knowledgeGraph"]
+            snippets.insert(0, json.dumps({k: kg.get(k) for k in
+                ("title", "type", "description", "attributes") if kg.get(k)}))
+        return snippets
+    except Exception as e:
+        log.warning("Serper search failed for '%s': %s", query, e)
+        return []
+
+
+ENRICHMENT_SYSTEM = """You are a company research analyst. You will be given Google search \
+results about a company. Extract or estimate the following fields.
+
+IMPORTANT RULES:
+- You must ALWAYS provide a number for revenue_millions and employees — never null, never "unknown"
+- If you cannot find exact data, make your best estimate based on industry, company size signals, \
+  funding stage, employee count, or any other clues in the results
+- For a tiny startup with 5 employees, revenue might be $0.5M. For a 50-person SaaS company, \
+  maybe $5M. Use your judgment.
+- For website, return the most likely company homepage URL you can find in the results
+
+Reply ONLY with this exact JSON:
+{
+  "revenue_millions": <number, your best estimate>,
+  "employees": <integer, your best estimate>,
+  "website": "<homepage URL or empty string if truly not findable>",
+  "revenue_confidence": "high", "medium", or "low"
+}"""
+
+
+def enrich_company(company: str) -> dict:
+    """
+    Search Google for the company via Serper, feed results to OpenAI,
+    and return revenue_millions, employees, website, revenue_confidence.
+    Results are cached so each company is only looked up once.
+    """
+    key = company.strip().lower()
+    if key in _company_cache:
+        return _company_cache[key]
+
+    all_snippets = serper_search(f"{company} company revenue employees website")
+    context = "\n\n---\n\n".join(all_snippets[:10])
+    user_msg = f"Company: {company}\n\nSearch results:\n{context}"
+
+    try:
+        resp = openai_client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[
+                {"role": "system", "content": ENRICHMENT_SYSTEM},
+                {"role": "user",   "content": user_msg},
+            ],
+            max_tokens=120,
+            temperature=0,
+        )
+        result = json.loads(resp.choices[0].message.content.strip())
+        # Ensure revenue and employees are always numbers
+        if not result.get("revenue_millions"):
+            result["revenue_millions"] = 1.0
+        if not result.get("employees"):
+            result["employees"] = 10
+    except Exception as e:
+        log.warning("OpenAI enrichment failed for %s: %s", company, e)
+        result = {"revenue_millions": 1.0, "employees": 10, "website": "", "revenue_confidence": "low"}
+
+    _company_cache[key] = result
+    save_company_cache(_company_cache)
+    log.info("  Enriched '%s': $%.1fM rev, %s employees, %s [%s confidence]",
+             company, result["revenue_millions"], result["employees"],
+             result.get("website", ""), result.get("revenue_confidence", "?"))
+    return result
+
+
+def revenue_over_limit(company: str) -> bool:
+    data = enrich_company(company)
+    return data["revenue_millions"] > MAX_REVENUE_MILLION
+
+
+# ---------------------------------------------------------------------------
+# Stage 1 — Quick AI filter (job text only, no Serper credits spent)
+# ---------------------------------------------------------------------------
+
+STAGE1_SYSTEM = """You are a filter for a NetSuite ERP sales rep.
+
+Your ONLY job is to decide if this job posting is worth researching further. \
+Be generous — if there is any chance it could be a legit ERP prospect, pass it through.
+
+IMMEDIATELY REJECT (return false) if:
+- The hiring company is a staffing agency, recruiter, headhunter, or executive search firm \
+  (Robert Half, Kforce, Randstad, Vaco, CyberCoders, Michael Page, etc.)
+- The posting is for a "client" — the real employer is hidden
+- The role is purely bookkeeping, accounts payable, or payroll with no systems scope
+- The company is clearly a large enterprise (publicly traded, thousands of employees)
+
+PASS THROUGH (return true) if:
+- Role is Controller, CFO, "Chief Financial Officer", or "Fractional CFO"
+- There is a mention of QuickBooks, ERP, NetSuite, or improving finance operations, evaluating current systems
+
+Reply ONLY with this JSON:
+{
+  "pass": true or false,
+  "reason": "one sentence"
+}"""
+
+
+def ai_stage1_filter(title: str, company: str, description: str) -> tuple[bool, str]:
+    """Quick cheap filter — pass/fail with one-line reason."""
+    desc_snippet = (description or "")[:1500]
+    user_msg = f"Job Title: {title}\nCompany: {company}\n\nDescription:\n{desc_snippet}"
+    try:
+        resp = openai_client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[
+                {"role": "system", "content": STAGE1_SYSTEM},
+                {"role": "user",   "content": user_msg},
+            ],
+            max_tokens=60,
+            temperature=0,
+        )
+        data = json.loads(resp.choices[0].message.content.strip())
+        return bool(data.get("pass")), str(data.get("reason", ""))
+    except Exception as e:
+        log.warning("Stage1 filter failed for %s @ %s: %s", title, company, e)
+        return True, "filter error — passing through"
+
+
+# ---------------------------------------------------------------------------
+# Stage 3 — Final AI verdict (job text + enrichment data)
+# ---------------------------------------------------------------------------
+
+STAGE3_SYSTEM = """You are a senior sales intelligence analyst for a NetSuite ERP sales rep \
+targeting companies with $1M–$15M in annual revenue.
+
+You will receive a job posting AND enriched company data (revenue estimate, employee count, \
+website, industry). Make a final call on whether this company is a strong NetSuite prospect.
+
+A strong prospect:
+- Is a real end-user company (not a staffing firm or recruiter)
+- Has estimated revenue under $15M
+- The job posting signals ERP pain: outgrowing current software, implementing new systems, \
+  mentions of QuickBooks/Sage/Xero/spreadsheets, scaling finance team, Series A/B, \
+  audit readiness, month-end close challenges
+- Is hiring a Controller or CFO — a decision-maker who would buy or champion NetSuite
+
+Reply ONLY with this exact JSON:
+{
+  "is_prospect": true or false,
+  "confidence": "high", "medium", or "low",
+  "industry": "short label e.g. SaaS, E-commerce, Manufacturing",
+  "erp_signals": ["tag1", "tag2"],
+  "summary": "2-3 sentences for the sales rep: what the signal is and what to lead with in an outreach"
+}
+
+For erp_signals use only: "QuickBooks User", "ERP Migration", "Rapid Growth", "Series A/B", \
+"System Implementation", "Leadership Change", "Scaling Finance Team", "Spreadsheet Dependent", \
+"Month-End Close Pain", "Audit Readiness", "Sage User", "Xero User", "New ERP Search"."""
+
+
+def ai_stage3_verdict(title: str, company: str, description: str, enrichment: dict) -> dict:
+    """Final verdict using job text + enrichment data."""
+    desc_snippet = (description or "")[:2500]
+    enrich_str = (
+        f"Revenue estimate: ~${enrichment.get('revenue_millions', '?')}M "
+        f"({enrichment.get('revenue_confidence', '?')} confidence)\n"
+        f"Employees: {enrichment.get('employees', '?')}\n"
+        f"Website: {enrichment.get('website', 'unknown')}\n"
+        f"Industry (from web): {enrichment.get('industry_web', '')}"
+    )
+    user_msg = (
+        f"Job Title: {title}\nCompany: {company}\n\n"
+        f"--- Company Enrichment ---\n{enrich_str}\n\n"
+        f"--- Job Description ---\n{desc_snippet}"
+    )
+    try:
+        resp = openai_client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[
+                {"role": "system", "content": STAGE3_SYSTEM},
+                {"role": "user",   "content": user_msg},
+            ],
+            max_tokens=300,
+            temperature=0,
+        )
+        return json.loads(resp.choices[0].message.content.strip())
+    except Exception as e:
+        log.warning("Stage3 verdict failed for %s @ %s: %s", title, company, e)
+        return {"is_prospect": False, "confidence": "low", "industry": "", "erp_signals": [], "summary": "Evaluation error."}
+
+# ---------------------------------------------------------------------------
+# Digest log — tracks every flagged company for scheduled CSV summaries
+# ---------------------------------------------------------------------------
+
+def load_digest_log() -> list:
+    if DIGEST_FILE.exists():
+        try:
+            return json.loads(DIGEST_FILE.read_text())
+        except (json.JSONDecodeError, OSError):
+            pass
+    return []
+
+
+def append_digest_entry(company: str, website: str) -> None:
+    entries = load_digest_log()
+    entries.append({
+        "company": company,
+        "website": website,
+        "timestamp": datetime.now().isoformat(),
+    })
+    DIGEST_FILE.write_text(json.dumps(entries, indent=2))
+
+
+def send_digest(label: str, start: datetime, end: datetime) -> None:
+    entries = load_digest_log()
+    window = [
+        e for e in entries
+        if start <= datetime.fromisoformat(e["timestamp"]) < end
+    ]
+
+    if not window:
+        log.info("Digest '%s': no flagged companies in window.", label)
+        try:
+            requests.post(
+                DISCORD_WEBHOOK_URL,
+                json={"content": f"**{label}**\nNo new prospects flagged in this period."},
+                timeout=10,
+            ).raise_for_status()
+        except requests.RequestException as e:
+            log.error("Digest send failed: %s", e)
+        return
+
+    csv_lines = ["Company Name,URL"]
+    for e in window:
+        company = e["company"].replace('"', '""')
+        website = e["website"].replace('"', '""')
+        csv_lines.append(f'"{company}","{website}"')
+    csv_content = "\n".join(csv_lines)
+
+    try:
+        r = requests.post(
+            DISCORD_WEBHOOK_URL,
+            files={"file": ("digest.csv", csv_content.encode(), "text/csv")},
+            data={"payload_json": json.dumps({"content": f"**{label}** — {len(window)} prospect(s) flagged"})},
+            timeout=10,
+        )
+        r.raise_for_status()
+        log.info("Digest sent: %s (%d entries)", label, len(window))
+    except requests.RequestException as e:
+        log.error("Digest send failed: %s", e)
+
+
+def send_morning_digest() -> None:
+    """8 AM digest: covers 3:30 PM yesterday → 8:00 AM today."""
+    now = datetime.now()
+    end   = now.replace(hour=8,  minute=0,  second=0, microsecond=0)
+    start = (end - timedelta(days=1)).replace(hour=15, minute=30, second=0, microsecond=0)
+    send_digest("Morning Digest (3:30 PM – 8:00 AM)", start, end)
+
+
+def send_afternoon_digest() -> None:
+    """3:30 PM digest: covers 8:00 AM → 3:30 PM today."""
+    now = datetime.now()
+    end   = now.replace(hour=15, minute=30, second=0, microsecond=0)
+    start = now.replace(hour=8,  minute=0,  second=0, microsecond=0)
+    send_digest("End-of-Day Digest (8:00 AM – 3:30 PM)", start, end)
+
+
+# ---------------------------------------------------------------------------
+# Discord alert
+# ---------------------------------------------------------------------------
+
+COLOR_HIGH = 0x57F287   # green  — high confidence
+COLOR_MED  = 0xFEE75C   # yellow — medium confidence
+COLOR_LOW  = 0x95A5A6   # grey   — low confidence
+
+CONFIDENCE_COLOR = {"high": COLOR_HIGH, "medium": COLOR_MED, "low": COLOR_LOW}
+
+
+def build_embed(row, ai: dict, enrichment: dict) -> dict:
+    company   = row.get("company") or "Unknown Company"
+    title     = row.get("title") or "Unknown Title"
+    location  = row.get("location") or "Unknown Location"
+    job_url   = row.get("job_url") or ""
+    site      = str(row.get("site") or "").capitalize()
+    date_post = row.get("date_posted")
+
+    confidence  = ai.get("confidence", "low")
+    erp_signals = ai.get("erp_signals", [])
+    summary     = ai.get("summary", "")
+    industry    = ai.get("industry", "")
+
+    rev        = enrichment.get("revenue_millions", 1.0)
+    employees  = enrichment.get("employees", "?")
+    website    = enrichment.get("website", "")
+    rev_conf   = enrichment.get("revenue_confidence", "low")
+
+    rev_str    = f"~${rev:.1f}M ({rev_conf} confidence)"
+    company_display = f"[{company}]({website})" if website else company
+
+    signals_str = " ".join(f"`{s}`" for s in erp_signals) if erp_signals else "`No signals detected`"
+
+    date_str    = str(date_post)[:10] if date_post else ""
+    footer_text = f"Source: {site}  •  {date_str}" if date_str else f"Source: {site}"
+
+    fields = [
+        {"name": "📰 Job Posting",  "value": f"[{title}]({job_url})" if job_url else title, "inline": False},
+        {"name": "📍 Location",     "value": location,   "inline": True},
+        {"name": "💰 Revenue Est.", "value": rev_str,    "inline": True},
+        {"name": "👥 Employees",    "value": str(employees), "inline": True},
+    ]
+
+    if industry:
+        fields.append({"name": "🏭 Industry", "value": industry, "inline": False})
+
+    fields.append({"name": "⚡ ERP Signals", "value": signals_str, "inline": False})
+    fields.append({"name": "📝 Summary",     "value": summary,     "inline": False})
+
+    return {
+        "title": f"🎯 {company_display}",
+        "color": CONFIDENCE_COLOR.get(confidence, COLOR_LOW),
+        "fields": fields,
+        "footer": {"text": footer_text},
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+def send_discord(embed: dict) -> None:
+    try:
+        r = requests.post(DISCORD_WEBHOOK_URL, json={"embeds": [embed]}, timeout=10)
+        r.raise_for_status()
+    except requests.RequestException as e:
+        log.error("Discord send failed: %s", e)
+
+# ---------------------------------------------------------------------------
+# Core search loop
+# ---------------------------------------------------------------------------
+
+def run_search() -> None:
+    log.info("--- Starting search run ---")
+    seen = load_seen()
+    seen_this_run: set = set()  # catches dupes across location searches in the same run
+    new_count = 0
+
+    search_term = "Controller OR CFO OR \"Chief Financial Officer\""
+
+    location_list = (
+        [("USA", loc) for loc in US_LOCATIONS] +
+        [("Canada", loc) for loc in CA_LOCATIONS]
+    )
+
+    for country, location in location_list:
+        log.info("Searching %s, %s …", location, country)
+        try:
+            df = scrape_jobs(
+                site_name=["indeed", "linkedin", "zip_recruiter"],
+                search_term=search_term,
+                location=location,
+                results_wanted=50,
+                hours_old=HOURS_OLD,
+                country_indeed=country,
+                linkedin_fetch_description=True,
+            )
+        except Exception as e:
+            log.error("Scrape error for %s: %s", location, e)
+            continue
+
+        if df is None or df.empty:
+            log.info("  No results for %s", location)
+            continue
+
+        log.info("  Got %d postings from %s", len(df), location)
+
+        for _, row in df.iterrows():
+            jid = job_id(row)
+            ctk = company_title_key(row)
+            if jid in seen or ctk in seen_this_run:
+                continue
+            seen_this_run.add(ctk)
+
+            company     = str(row.get("company") or "").strip()
+            title       = str(row.get("title") or "").strip()
+            description = str(row.get("description") or "").strip()
+
+            # ── Pre-filter: staffing firm blocklist (free) ────────────────
+            if is_staffing_firm(company, description):
+                log.info("  STAFFING SKIP %s @ %s", title, company)
+                continue
+
+            # ── Stage 1: cheap AI filter ──────────────────────────────────
+            passed, reason = ai_stage1_filter(title, company, description)
+            if not passed:
+                log.info("  S1 SKIP %s @ %s — %s", title, company, reason)
+                continue
+            log.info("  S1 PASS %s @ %s — %s", title, company, reason)
+
+            # ── Stage 2: Serper enrichment ────────────────────────────────
+            enrichment = enrich_company(company) if company else {"revenue_millions": 1.0, "employees": 10, "website": "", "revenue_confidence": "low"}
+            est_revenue = enrichment["revenue_millions"]
+            if est_revenue > MAX_REVENUE_MILLION:
+                log.info("  S2 SKIP (revenue ~$%.0fM) %s @ %s", est_revenue, title, company)
+                continue
+
+            # ── Stage 3: final AI verdict with enrichment data ────────────
+            ai = ai_stage3_verdict(title, company, description, enrichment)
+            if not ai.get("is_prospect"):
+                log.info("  S3 SKIP %s @ %s — %s", title, company, ai.get("summary", ""))
+                continue
+
+            seen.add(jid)
+            new_count += 1
+            log.info("  ✓ HIT [%s] %s @ %s", ai.get("confidence"), title, company)
+
+            append_digest_entry(company, enrichment.get("website", ""))
+            embed = build_embed(row, ai, enrichment)
+            send_discord(embed)
+            time.sleep(0.5)
+
+        time.sleep(2)
+
+    save_seen(seen)
+    log.info("--- Run complete. %d new alerts sent. ---", new_count)
+
+# ---------------------------------------------------------------------------
+# Scheduler entry point
+# ---------------------------------------------------------------------------
+
+def main() -> None:
+    log.info("JobWatcher starting. Interval: every %dh. %d US + %d CA locations.",
+             SEARCH_INTERVAL_HOURS, len(US_LOCATIONS), len(CA_LOCATIONS))
+
+    run_search()
+
+    schedule.every(SEARCH_INTERVAL_HOURS).hours.do(run_search)
+    schedule.every().day.at("08:00").do(send_morning_digest)
+    schedule.every().day.at("15:30").do(send_afternoon_digest)
+    log.info("Scheduled. Next run in %dh. Digests at 08:00 and 15:30. Press Ctrl-C to stop.", SEARCH_INTERVAL_HOURS)
+
+    while True:
+        schedule.run_pending()
+        time.sleep(60)
+
+
+if __name__ == "__main__":
+    main()

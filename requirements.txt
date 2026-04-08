@@ -1,0 +1,6 @@
+python-jobspy
+requests
+python-dotenv
+schedule
+ddgs
+openai
