@@ -4,13 +4,16 @@ Searches job boards for finance leadership hires that signal ERP pain.
 Uses OpenAI to evaluate each posting rather than hardcoded keyword rules.
 """
 
+import asyncio
+import discord
 import json
 import os
+import threading
 import time
 import logging
 import warnings
 import urllib3
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone
 from pathlib import Path
 
 warnings.filterwarnings("ignore", category=DeprecationWarning)
@@ -32,6 +35,9 @@ load_dotenv()
 DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL")
 if not DISCORD_WEBHOOK_URL:
     raise RuntimeError("DISCORD_WEBHOOK_URL not set in .env")
+
+DISCORD_BOT_TOKEN  = os.getenv("DISCORD_BOT_TOKEN")
+DISCORD_CHANNEL_ID = int(os.getenv("DISCORD_CHANNEL_ID", "0"))
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 if not OPENAI_API_KEY:
@@ -418,19 +424,15 @@ def append_digest_entry(company: str, website: str) -> None:
     DIGEST_FILE.write_text(json.dumps(entries, indent=2))
 
 
-def send_digest(label: str, start: datetime, end: datetime) -> None:
+def send_full_digest() -> None:
+    """Send all accumulated leads as a CSV, then clear the log."""
     entries = load_digest_log()
-    window = [
-        e for e in entries
-        if start <= datetime.fromisoformat(e["timestamp"]) < end
-    ]
 
-    if not window:
-        log.info("Digest '%s': no flagged companies in window.", label)
+    if not entries:
         try:
             requests.post(
                 DISCORD_WEBHOOK_URL,
-                json={"content": f"**{label}**\nNo new prospects flagged in this period."},
+                json={"content": "No leads in the current list — nothing to export yet."},
                 timeout=10,
             ).raise_for_status()
         except requests.RequestException as e:
@@ -438,7 +440,7 @@ def send_digest(label: str, start: datetime, end: datetime) -> None:
         return
 
     csv_lines = ["Company Name,URL"]
-    for e in window:
+    for e in entries:
         company = e["company"].replace('"', '""')
         website = e["website"].replace('"', '""')
         csv_lines.append(f'"{company}","{website}"')
@@ -447,30 +449,15 @@ def send_digest(label: str, start: datetime, end: datetime) -> None:
     try:
         r = requests.post(
             DISCORD_WEBHOOK_URL,
-            files={"file": ("digest.csv", csv_content.encode(), "text/csv")},
-            data={"payload_json": json.dumps({"content": f"**{label}** — {len(window)} prospect(s) flagged"})},
+            files={"file": ("leads.csv", csv_content.encode(), "text/csv")},
+            data={"payload_json": json.dumps({"content": f"**Leads Export** — {len(entries)} prospect(s). List cleared."})},
             timeout=10,
         )
         r.raise_for_status()
-        log.info("Digest sent: %s (%d entries)", label, len(window))
+        DIGEST_FILE.write_text(json.dumps([], indent=2))
+        log.info("Full digest sent and cleared (%d entries)", len(entries))
     except requests.RequestException as e:
         log.error("Digest send failed: %s", e)
-
-
-def send_morning_digest() -> None:
-    """8 AM digest: covers 3:30 PM yesterday → 8:00 AM today."""
-    now = datetime.now()
-    end   = now.replace(hour=8,  minute=0,  second=0, microsecond=0)
-    start = (end - timedelta(days=1)).replace(hour=15, minute=30, second=0, microsecond=0)
-    send_digest("Morning Digest (3:30 PM – 8:00 AM)", start, end)
-
-
-def send_afternoon_digest() -> None:
-    """3:30 PM digest: covers 8:00 AM → 3:30 PM today."""
-    now = datetime.now()
-    end   = now.replace(hour=15, minute=30, second=0, microsecond=0)
-    start = now.replace(hour=8,  minute=0,  second=0, microsecond=0)
-    send_digest("End-of-Day Digest (8:00 AM – 3:30 PM)", start, end)
 
 
 # ---------------------------------------------------------------------------
@@ -560,7 +547,7 @@ def run_search() -> None:
         log.info("Searching %s, %s …", location, country)
         try:
             df = scrape_jobs(
-                site_name=["indeed", "linkedin", "zip_recruiter"],
+                site_name=["indeed", "linkedin"],
                 search_term=search_term,
                 location=location,
                 results_wanted=50,
@@ -629,6 +616,37 @@ def run_search() -> None:
     log.info("--- Run complete. %d new alerts sent. ---", new_count)
 
 # ---------------------------------------------------------------------------
+# Discord bot — listens for "csv" and triggers on-demand export
+# ---------------------------------------------------------------------------
+
+def run_discord_bot() -> None:
+    if not DISCORD_BOT_TOKEN or not DISCORD_CHANNEL_ID:
+        log.warning("Discord bot not started — DISCORD_BOT_TOKEN or DISCORD_CHANNEL_ID not set.")
+        return
+
+    intents = discord.Intents.default()
+    intents.message_content = True
+    client = discord.Client(intents=intents)
+
+    @client.event
+    async def on_ready():
+        log.info("Discord bot connected as %s", client.user)
+
+    @client.event
+    async def on_message(message):
+        if message.author == client.user:
+            return
+        if message.channel.id != DISCORD_CHANNEL_ID:
+            return
+        if message.content.strip().lower() == "csv":
+            log.info("CSV trigger received from %s", message.author)
+            loop = asyncio.get_event_loop()
+            await loop.run_in_executor(None, send_full_digest)
+
+    client.run(DISCORD_BOT_TOKEN)
+
+
+# ---------------------------------------------------------------------------
 # Scheduler entry point
 # ---------------------------------------------------------------------------
 
@@ -639,9 +657,10 @@ def main() -> None:
     run_search()
 
     schedule.every(SEARCH_INTERVAL_HOURS).hours.do(run_search)
-    schedule.every().day.at("08:00").do(send_morning_digest)
-    schedule.every().day.at("15:30").do(send_afternoon_digest)
-    log.info("Scheduled. Next run in %dh. Digests at 08:00 and 15:30. Press Ctrl-C to stop.", SEARCH_INTERVAL_HOURS)
+    log.info("Scheduled. Next run in %dh. Type 'csv' in Discord to export and clear leads. Press Ctrl-C to stop.", SEARCH_INTERVAL_HOURS)
+
+    bot_thread = threading.Thread(target=run_discord_bot, daemon=True)
+    bot_thread.start()
 
     while True:
         schedule.run_pending()

@@ -4,3 +4,4 @@ python-dotenv
 schedule
 ddgs
 openai
+discord.py
