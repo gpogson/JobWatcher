@@ -8,6 +8,7 @@ import asyncio
 import discord
 import json
 import os
+import re
 import threading
 import time
 import logging
@@ -49,10 +50,11 @@ if not SERPER_API_KEY:
 
 openai_client = OpenAI(api_key=OPENAI_API_KEY)
 
-SEEN_FILE           = Path(__file__).parent / "seen_jobs.json"
-COMPANY_CACHE_FILE  = Path(__file__).parent / "company_cache.json"
-LOG_FILE            = Path(__file__).parent / "watcher.log"
-DIGEST_FILE         = Path(__file__).parent / "digest_log.json"
+SEEN_FILE              = Path(__file__).parent / "seen_jobs.json"
+COMPANY_CACHE_FILE     = Path(__file__).parent / "company_cache.json"
+LOG_FILE               = Path(__file__).parent / "watcher.log"
+DIGEST_FILE            = Path(__file__).parent / "digest_log.json"
+CUSTOM_BLOCKLIST_FILE  = Path(__file__).parent / "custom_blocklist.json"
 
 # Maximum estimated company revenue to alert on (millions USD).
 # Companies confirmed over this are skipped. Unknown revenue passes through.
@@ -145,6 +147,31 @@ STAFFING_NAME_KEYWORDS = [
     "workforce solutions", "placement", "temp agency", "contract staffing",
 ]
 
+# User-flagged firms added via 👎 reaction in Discord
+def load_custom_blocklist() -> list:
+    if CUSTOM_BLOCKLIST_FILE.exists():
+        try:
+            return json.loads(CUSTOM_BLOCKLIST_FILE.read_text())
+        except (json.JSONDecodeError, OSError):
+            pass
+    return []
+
+
+def save_custom_blocklist(blocklist: list) -> None:
+    CUSTOM_BLOCKLIST_FILE.write_text(json.dumps(sorted(blocklist), indent=2))
+
+
+def add_to_custom_blocklist(company: str) -> None:
+    entry = company.strip().lower()
+    if entry not in _custom_blocklist:
+        _custom_blocklist.append(entry)
+        save_custom_blocklist(_custom_blocklist)
+        log.info("Added '%s' to custom staffing blocklist", company)
+
+
+_custom_blocklist: list = load_custom_blocklist()
+
+
 # Red-flag phrases in the job description body
 STAFFING_DESCRIPTION_PHRASES = [
     "our client is", "our client has", "on behalf of our client",
@@ -157,6 +184,11 @@ def is_staffing_firm(company: str, description: str) -> bool:
     """Returns True if the posting is from a recruiter or staffing agency."""
     co = company.lower()
     desc = description.lower()
+
+    # User-flagged firms (via 👎 reaction in Discord)
+    for entry in _custom_blocklist:
+        if entry in co:
+            return True
 
     # Exact known firm match
     for firm in STAFFING_FIRM_NAMES:
@@ -642,6 +674,42 @@ def run_discord_bot() -> None:
             log.info("CSV trigger received from %s", message.author)
             loop = asyncio.get_event_loop()
             await loop.run_in_executor(None, send_full_digest)
+
+    @client.event
+    async def on_raw_reaction_add(payload):
+        if payload.user_id == client.user.id:
+            return
+        if payload.channel_id != DISCORD_CHANNEL_ID:
+            return
+        if str(payload.emoji) != "👎":
+            return
+
+        channel = client.get_channel(payload.channel_id)
+        if not channel:
+            channel = await client.fetch_channel(payload.channel_id)
+
+        try:
+            message = await channel.fetch_message(payload.message_id)
+        except discord.NotFound:
+            return
+
+        if not message.embeds:
+            return
+
+        title = message.embeds[0].title or ""
+        if not title.startswith("🎯"):
+            return
+
+        # Parse company name — title is either "🎯 Company" or "🎯 [Company](url)"
+        raw = title.lstrip("🎯").strip()
+        match = re.match(r'^\[(.+?)\]\(.+?\)$', raw)
+        company = match.group(1) if match else raw
+
+        if not company:
+            return
+
+        add_to_custom_blocklist(company)
+        await channel.send(f"👎 Added **{company}** to the staffing blocklist — they'll be skipped from now on.")
 
     client.run(DISCORD_BOT_TOKEN)
 
