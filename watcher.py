@@ -8,6 +8,7 @@ import asyncio
 import discord
 import json
 import os
+import random
 import re
 import threading
 import time
@@ -22,7 +23,6 @@ warnings.filterwarnings("ignore", category=ResourceWarning)
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 import requests
-import schedule
 from dotenv import load_dotenv
 from jobspy import scrape_jobs
 from openai import OpenAI
@@ -61,7 +61,7 @@ CUSTOM_BLOCKLIST_FILE  = Path(__file__).parent / "custom_blocklist.json"
 MAX_REVENUE_MILLION = 15
 
 # Search every N hours
-SEARCH_INTERVAL_HOURS = 4
+SEARCH_INTERVAL_HOURS = 1
 HOURS_OLD = SEARCH_INTERVAL_HOURS + 1
 
 # US states to search
@@ -768,15 +768,15 @@ def main() -> None:
 
     run_search()
 
-    schedule.every(SEARCH_INTERVAL_HOURS).hours.do(run_search)
-    log.info("Scheduled. Next run in %dh. Type 'csv' in Discord to export and clear leads. Press Ctrl-C to stop.", SEARCH_INTERVAL_HOURS)
-
     bot_thread = threading.Thread(target=run_discord_bot, daemon=True)
     bot_thread.start()
 
     while True:
-        schedule.run_pending()
-        time.sleep(60)
+        jitter = random.randint(-10, 10)
+        sleep_minutes = 60 + jitter
+        log.info("Next run in %d minutes.", sleep_minutes)
+        time.sleep(sleep_minutes * 60)
+        run_search()
 
 
 if __name__ == "__main__":
