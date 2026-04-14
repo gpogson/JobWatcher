@@ -207,6 +207,39 @@ def is_staffing_firm(company: str, description: str) -> bool:
 
     return False
 
+
+# ---------------------------------------------------------------------------
+# Keyword tiers — deterministic scan (free, no API cost)
+# ---------------------------------------------------------------------------
+
+# Tier 1: direct buying signals — company is actively evaluating or moving ERP
+TIER1_KEYWORDS = [
+    "netsuite",
+    "erp evaluation", "erp selection", "erp implementation", "erp migration",
+    "erp upgrade", "erp project", "new erp", "evaluating erp", "evaluating systems",
+    "system evaluation", "system selection", "implementing new system",
+    "implementing a new system", "replace our accounting", "erp replacement",
+    "financial system implementation", "new accounting system",
+]
+
+# Tier 2: legacy / pain signals — strong indicators they need an upgrade
+TIER2_KEYWORDS = [
+    "quickbooks", "quick books",
+    "sage", "xero", "excel-based", "spreadsheets", "spreadsheet",
+    "great plains", "acumatica", "intacct", "epicor",
+    "oracle", "sap", "dynamics 365", "ms dynamics",
+    "manual processes", "manual reporting", "manual consolidation",
+]
+
+
+def find_keywords(description: str) -> tuple[list[str], list[str]]:
+    """Return (tier1_matches, tier2_matches) found in the job description."""
+    desc = description.lower()
+    tier1 = [kw for kw in TIER1_KEYWORDS if kw in desc]
+    tier2 = [kw for kw in TIER2_KEYWORDS if kw in desc]
+    return tier1, tier2
+
+
 # ---------------------------------------------------------------------------
 # Company enrichment (Serper → OpenAI)
 # Returns: revenue_millions (float), employees (int), website (str)
@@ -395,7 +428,7 @@ Reply ONLY with this exact JSON:
   "confidence": "high", "medium", or "low",
   "industry": "short label e.g. SaaS, E-commerce, Manufacturing",
   "erp_signals": ["tag1", "tag2"],
-  "summary": "2-3 sentences for the sales rep: what the signal is and what to lead with in an outreach"
+  "summary": "2-3 sentences: first, describe what the company does and their business model; then describe what their current finance/systems pain point appears to be based on the posting"
 }
 
 For erp_signals use only: "QuickBooks User", "ERP Migration", "Rapid Growth", "Series A/B", \
@@ -503,7 +536,7 @@ COLOR_LOW  = 0x95A5A6   # grey   — low confidence
 CONFIDENCE_COLOR = {"high": COLOR_HIGH, "medium": COLOR_MED, "low": COLOR_LOW}
 
 
-def build_embed(row, ai: dict, enrichment: dict) -> dict:
+def build_embed(row, ai: dict, enrichment: dict, tier1_hits: list, tier2_hits: list) -> dict:
     company   = row.get("company") or "Unknown Company"
     title     = row.get("title") or "Unknown Title"
     location  = row.get("location") or "Unknown Location"
@@ -529,6 +562,9 @@ def build_embed(row, ai: dict, enrichment: dict) -> dict:
     date_str    = str(date_post)[:10] if date_post else ""
     footer_text = f"Source: {site}  •  {date_str}" if date_str else f"Source: {site}"
 
+    # Tier 1 hits force green regardless of AI confidence
+    color = COLOR_HIGH if tier1_hits else CONFIDENCE_COLOR.get(confidence, COLOR_LOW)
+
     fields = [
         {"name": "📰 Job Posting",  "value": f"[{title}]({job_url})" if job_url else title, "inline": False},
         {"name": "📍 Location",     "value": location,   "inline": True},
@@ -539,12 +575,18 @@ def build_embed(row, ai: dict, enrichment: dict) -> dict:
     if industry:
         fields.append({"name": "🏭 Industry", "value": industry, "inline": False})
 
+    if tier1_hits:
+        fields.append({"name": "🔥 Hot Keywords", "value": " ".join(f"`{kw}`" for kw in tier1_hits), "inline": False})
+
+    if tier2_hits:
+        fields.append({"name": "⚠️ Legacy System Keywords", "value": " ".join(f"`{kw}`" for kw in tier2_hits), "inline": False})
+
     fields.append({"name": "⚡ ERP Signals", "value": signals_str, "inline": False})
     fields.append({"name": "📝 Summary",     "value": summary,     "inline": False})
 
     return {
         "title": f"🎯 {company_display}",
-        "color": CONFIDENCE_COLOR.get(confidence, COLOR_LOW),
+        "color": color,
         "fields": fields,
         "footer": {"text": footer_text},
         "timestamp": datetime.now(timezone.utc).isoformat(),
@@ -635,10 +677,12 @@ def run_search() -> None:
 
             seen.add(jid)
             new_count += 1
-            log.info("  ✓ HIT [%s] %s @ %s", ai.get("confidence"), title, company)
+            tier1_hits, tier2_hits = find_keywords(description)
+            log.info("  ✓ HIT [%s] %s @ %s | T1:%s T2:%s",
+                     ai.get("confidence"), title, company, tier1_hits, tier2_hits)
 
             append_digest_entry(company, enrichment.get("website", ""))
-            embed = build_embed(row, ai, enrichment)
+            embed = build_embed(row, ai, enrichment, tier1_hits, tier2_hits)
             send_discord(embed)
             time.sleep(0.5)
 
