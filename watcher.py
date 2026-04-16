@@ -81,12 +81,11 @@ CA_LOCATIONS = [
 # Allowed location terms — any job location must contain at least one of these (case-insensitive).
 # Jobs with no location ("Unknown Location") are always allowed through.
 ALLOWED_LOCATIONS = {loc.lower() for loc in US_LOCATIONS + CA_LOCATIONS} | {
-    # Abbreviations and alternate names
-    "wa", "or", "id", "mt", "nd", "sd", "mn", "ne", "ks", "ok", "co", "wy",
-    "nm", "az", "ut", "nv", "ca", "ak", "hi", "bc", "ab", "sk",
+    # Full name alternates (no abbreviations — too short, cause false matches e.g. "co" in "mexico")
     "washington", "oregon", "idaho", "montana", "minnesota", "nebraska",
     "kansas", "oklahoma", "colorado", "wyoming", "nevada", "california",
-    "alaska", "hawaii", "alberta", "saskatchewan",
+    "alaska", "hawaii", "alberta", "saskatchewan", "british columbia",
+    "yukon", "northwest territories",
 }
 
 def is_allowed_location(location: str) -> bool:
@@ -206,6 +205,32 @@ STAFFING_DESCRIPTION_PHRASES = [
     "our client, a", "confidential client", "our client company",
     "working with a client", "placed at our client", "client of ours",
 ]
+
+
+TITLE_ALLOW = [
+    "controller", "cfo", "chief financial officer", "fractional cfo",
+    "vp of finance", "vp finance", "vice president of finance",
+    "vice president finance", "director of finance", "finance director",
+]
+
+TITLE_BLOCK = [
+    "plant controller", "inventory controller", "project controller",
+    "production controller", "document controller", "cost controller",
+    "stock controller", "logistics controller", "traffic controller",
+    "accounting manager", "accounts payable", "accounts receivable",
+    "bookkeeper", "payroll", "staff accountant", "senior accountant",
+]
+
+
+def is_target_title(title: str) -> bool:
+    """Return True only if the title is a finance leadership role we care about."""
+    t = title.lower()
+    # Block known noise titles first
+    for blocked in TITLE_BLOCK:
+        if blocked in t:
+            return False
+    # Must match at least one allowed title
+    return any(allowed in t for allowed in TITLE_ALLOW)
 
 
 def is_staffing_firm(company: str, description: str) -> bool:
@@ -694,6 +719,11 @@ def run_search() -> None:
             # ── Pre-filter: staffing firm blocklist (free) ────────────────
             if is_staffing_firm(company, description):
                 log.info("  STAFFING SKIP %s @ %s", title, company)
+                continue
+
+            # ── Pre-filter: title check (free) ───────────────────────────
+            if not is_target_title(title):
+                log.info("  TITLE SKIP %s @ %s", title, company)
                 continue
 
             # ── Pre-filter: location check (free) ────────────────────────
