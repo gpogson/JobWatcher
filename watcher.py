@@ -15,7 +15,7 @@ import time
 import logging
 import warnings
 import urllib3
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
 warnings.filterwarnings("ignore", category=DeprecationWarning)
@@ -61,7 +61,7 @@ CUSTOM_BLOCKLIST_FILE  = Path(__file__).parent / "custom_blocklist.json"
 MAX_REVENUE_MILLION = 15
 
 # Search every N hours
-SEARCH_INTERVAL_HOURS = 1
+SEARCH_INTERVAL_HOURS = 2
 HOURS_OLD = SEARCH_INTERVAL_HOURS + 1
 
 # US states to search
@@ -77,6 +77,25 @@ CA_LOCATIONS = [
     "Yukon", "Northwest Territories", "British Columbia",
     "Alberta", "Saskatchewan",
 ]
+
+# Allowed location terms — any job location must contain at least one of these (case-insensitive).
+# Jobs with no location ("Unknown Location") are always allowed through.
+ALLOWED_LOCATIONS = {loc.lower() for loc in US_LOCATIONS + CA_LOCATIONS} | {
+    # Abbreviations and alternate names
+    "wa", "or", "id", "mt", "nd", "sd", "mn", "ne", "ks", "ok", "co", "wy",
+    "nm", "az", "ut", "nv", "ca", "ak", "hi", "bc", "ab", "sk",
+    "washington", "oregon", "idaho", "montana", "minnesota", "nebraska",
+    "kansas", "oklahoma", "colorado", "wyoming", "nevada", "california",
+    "alaska", "hawaii", "alberta", "saskatchewan",
+}
+
+def is_allowed_location(location: str) -> bool:
+    """Return True if location is in target territory or unknown."""
+    loc = location.strip().lower()
+    if not loc or loc == "unknown location":
+        return True
+    return any(allowed in loc for allowed in ALLOWED_LOCATIONS)
+
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -96,17 +115,26 @@ log = logging.getLogger("jobwatcher")
 # Deduplication
 # ---------------------------------------------------------------------------
 
-def load_seen() -> set:
+SEEN_MAX_DAYS = 7  # prune job IDs older than this many days
+
+
+def load_seen() -> dict:
+    """Load seen jobs as {job_id: iso_timestamp}. Prunes entries older than SEEN_MAX_DAYS."""
     if SEEN_FILE.exists():
         try:
-            return set(json.loads(SEEN_FILE.read_text()))
+            data = json.loads(SEEN_FILE.read_text())
+            # Support old format (plain list) by converting to dict with today's date
+            if isinstance(data, list):
+                data = {jid: datetime.now().isoformat() for jid in data}
+            cutoff = (datetime.now() - timedelta(days=SEEN_MAX_DAYS)).isoformat()
+            return {jid: ts for jid, ts in data.items() if ts >= cutoff}
         except (json.JSONDecodeError, OSError):
             pass
-    return set()
+    return {}
 
 
-def save_seen(seen: set) -> None:
-    SEEN_FILE.write_text(json.dumps(sorted(seen), indent=2))
+def save_seen(seen: dict) -> None:
+    SEEN_FILE.write_text(json.dumps(seen, indent=2))
 
 
 def job_id(row) -> str:
@@ -479,11 +507,19 @@ def load_digest_log() -> list:
     return []
 
 
-def append_digest_entry(company: str, website: str) -> None:
+def append_digest_entry(company: str, website: str, title: str, job_url: str,
+                        location: str, tier1_hits: list, tier2_hits: list,
+                        description: str) -> None:
     entries = load_digest_log()
     entries.append({
         "company": company,
         "website": website,
+        "job_title": title,
+        "job_url": job_url,
+        "location": location,
+        "hot_keywords": ", ".join(tier1_hits),
+        "legacy_keywords": ", ".join(tier2_hits),
+        "description_snippet": (description or "")[:2000],
         "timestamp": datetime.now().isoformat(),
     })
     DIGEST_FILE.write_text(json.dumps(entries, indent=2))
@@ -504,11 +540,14 @@ def send_full_digest() -> None:
             log.error("Digest send failed: %s", e)
         return
 
-    csv_lines = ["Company Name,URL"]
+    csv_lines = ["Company Name,Website,Job Title,Job URL,Location,Hot Keywords,Legacy Keywords,Job Description Snippet"]
     for e in entries:
-        company = e["company"].replace('"', '""')
-        website = e["website"].replace('"', '""')
-        csv_lines.append(f'"{company}","{website}"')
+        def esc(val):
+            return str(e.get(val, "")).replace('"', '""')
+        csv_lines.append(
+            f'"{esc("company")}","{esc("website")}","{esc("job_title")}","{esc("job_url")}",'
+            f'"{esc("location")}","{esc("hot_keywords")}","{esc("legacy_keywords")}","{esc("description_snippet")}"'
+        )
     csv_content = "\n".join(csv_lines)
 
     try:
@@ -559,7 +598,9 @@ def build_embed(row, ai: dict, enrichment: dict, tier1_hits: list, tier2_hits: l
 
     signals_str = " ".join(f"`{s}`" for s in erp_signals) if erp_signals else "`No signals detected`"
 
-    date_str    = str(date_post)[:10] if date_post else ""
+    date_str = ""
+    if date_post and str(date_post).lower() not in ("nan", "none", "nat", ""):
+        date_str = str(date_post)[:10]
     footer_text = f"Source: {site}  •  {date_str}" if date_str else f"Source: {site}"
 
     # Tier 1 hits force green regardless of AI confidence
@@ -655,6 +696,12 @@ def run_search() -> None:
                 log.info("  STAFFING SKIP %s @ %s", title, company)
                 continue
 
+            # ── Pre-filter: location check (free) ────────────────────────
+            job_location = str(row.get("location") or "").strip()
+            if not is_allowed_location(job_location):
+                log.info("  LOCATION SKIP %s @ %s (%s)", title, company, job_location)
+                continue
+
             # ── Stage 1: cheap AI filter ──────────────────────────────────
             passed, reason = ai_stage1_filter(title, company, description)
             if not passed:
@@ -675,13 +722,18 @@ def run_search() -> None:
                 log.info("  S3 SKIP %s @ %s — %s", title, company, ai.get("summary", ""))
                 continue
 
-            seen.add(jid)
+            seen[jid] = datetime.now().isoformat()
             new_count += 1
             tier1_hits, tier2_hits = find_keywords(description)
             log.info("  ✓ HIT [%s] %s @ %s | T1:%s T2:%s",
                      ai.get("confidence"), title, company, tier1_hits, tier2_hits)
 
-            append_digest_entry(company, enrichment.get("website", ""))
+            append_digest_entry(
+                company, enrichment.get("website", ""),
+                title, str(row.get("job_url") or ""),
+                str(row.get("location") or ""),
+                tier1_hits, tier2_hits, description,
+            )
             embed = build_embed(row, ai, enrichment, tier1_hits, tier2_hits)
             send_discord(embed)
             time.sleep(0.5)
