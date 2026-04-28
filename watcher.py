@@ -61,7 +61,7 @@ CUSTOM_BLOCKLIST_FILE  = Path(__file__).parent / "custom_blocklist.json"
 MAX_REVENUE_MILLION = 15
 
 # Search every N hours
-SEARCH_INTERVAL_HOURS = 2
+SEARCH_INTERVAL_HOURS = 3
 HOURS_OLD = SEARCH_INTERVAL_HOURS + 1
 
 # US states to search
