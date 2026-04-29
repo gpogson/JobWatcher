@@ -211,6 +211,11 @@ TITLE_ALLOW = [
     "controller", "cfo", "chief financial officer", "fractional cfo",
     "vp of finance", "vp finance", "vice president of finance",
     "vice president finance", "director of finance", "finance director",
+    "financial controller", "corporate controller", "assistant controller",
+    "finance manager", "vp accounting", "vp of accounting",
+    "vice president of accounting", "vice president accounting",
+    "director of accounting", "accounting director",
+    "head of finance", "head of accounting",
 ]
 
 TITLE_BLOCK = [
@@ -676,7 +681,13 @@ def run_search() -> None:
     seen_this_run: set = set()  # catches dupes across location searches in the same run
     new_count = 0
 
-    search_term = "Controller OR CFO OR \"Chief Financial Officer\""
+    search_term = (
+        'Controller OR CFO OR "Chief Financial Officer" OR "Fractional CFO" '
+        'OR "Director of Finance" OR "Finance Director" OR "Head of Finance" '
+        'OR "VP Finance" OR "VP of Finance" OR "Vice President of Finance" '
+        'OR "VP Accounting" OR "VP of Accounting" OR "Director of Accounting" '
+        'OR "Head of Accounting" OR "Finance Manager"'
+    )
 
     location_list = (
         [("USA", loc) for loc in US_LOCATIONS] +
@@ -724,12 +735,6 @@ def run_search() -> None:
             # ── Pre-filter: title check (free) ───────────────────────────
             if not is_target_title(title):
                 log.info("  TITLE SKIP %s @ %s", title, company)
-                continue
-
-            # ── Pre-filter: location check (free) ────────────────────────
-            job_location = str(row.get("location") or "").strip()
-            if not is_allowed_location(job_location):
-                log.info("  LOCATION SKIP %s @ %s (%s)", title, company, job_location)
                 continue
 
             # ── Stage 1: cheap AI filter ──────────────────────────────────
@@ -855,7 +860,7 @@ def main() -> None:
 
     while True:
         jitter = random.randint(-10, 10)
-        sleep_minutes = 60 + jitter
+        sleep_minutes = (SEARCH_INTERVAL_HOURS * 60) + jitter
         log.info("Next run in %d minutes.", sleep_minutes)
         time.sleep(sleep_minutes * 60)
         run_search()
