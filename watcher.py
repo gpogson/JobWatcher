@@ -58,7 +58,7 @@ CUSTOM_BLOCKLIST_FILE  = Path(__file__).parent / "custom_blocklist.json"
 
 # Maximum estimated company revenue to alert on (millions USD).
 # Companies confirmed over this are skipped. Unknown revenue passes through.
-MAX_REVENUE_MILLION = 15
+MAX_REVENUE_MILLION = 50
 
 # Search every N hours
 SEARCH_INTERVAL_HOURS = 3
