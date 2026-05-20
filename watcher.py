@@ -37,6 +37,10 @@ DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL")
 if not DISCORD_WEBHOOK_URL:
     raise RuntimeError("DISCORD_WEBHOOK_URL not set in .env")
 
+WEST_WEBHOOK_URL = os.getenv("WEST_WEBHOOK_URL")
+if not WEST_WEBHOOK_URL:
+    raise RuntimeError("WEST_WEBHOOK_URL not set in .env")
+
 DISCORD_BOT_TOKEN  = os.getenv("DISCORD_BOT_TOKEN")
 DISCORD_CHANNEL_ID = int(os.getenv("DISCORD_CHANNEL_ID", "0"))
 
@@ -55,6 +59,7 @@ COMPANY_CACHE_FILE     = Path(__file__).parent / "company_cache.json"
 LOG_FILE               = Path(__file__).parent / "watcher.log"
 DIGEST_FILE            = Path(__file__).parent / "digest_log.json"
 CUSTOM_BLOCKLIST_FILE  = Path(__file__).parent / "custom_blocklist.json"
+SEEN_COMPANIES_FILE    = Path(__file__).parent / "seen_companies.json"
 
 # Maximum estimated company revenue to alert on (millions USD).
 # Companies confirmed over this are skipped. Unknown revenue passes through.
@@ -77,6 +82,36 @@ CA_LOCATIONS = [
     "Yukon", "Northwest Territories", "British Columbia",
     "Alberta", "Saskatchewan",
 ]
+
+# West territory — company HQ must be in one of these to route to the West channel.
+WEST_STATES = {
+    # Full names
+    "alaska", "british columbia", "california", "hawaii", "idaho",
+    "northern mariana islands", "northwest territories", "nunavut",
+    "nevada", "oregon", "utah", "washington", "yukon",
+    # Abbreviations
+    "ak", "bc", "ca", "hi", "id", "mp", "nt", "nu", "nv", "or", "ut", "wa", "yt",
+}
+
+# Industry keywords that qualify a lead for the West channel.
+WEST_INDUSTRIES = [
+    "agriculture", "farming", "livestock", "crop",
+    "manufacturing", "aerospace", "defense", "automotive", "electronics",
+    "furniture", "textiles", "apparel", "chemicals", "industrial",
+    "food", "beverage", "packaged food",
+    "retail", "grocery", "e-commerce", "ecommerce", "wholesale", "distribution",
+    "consumer goods",
+]
+
+
+def is_west_lead(enrichment: dict, ai: dict) -> bool:
+    """Return True if the company HQ is in the West territory AND industry matches."""
+    hq = enrichment.get("hq_state", "").strip().lower()
+    industry = (ai.get("industry") or "").lower()
+    in_west = any(state in hq for state in WEST_STATES) if hq else False
+    in_industry = any(kw in industry for kw in WEST_INDUSTRIES)
+    return in_west and in_industry
+
 
 # Allowed location terms — any job location must contain at least one of these (case-insensitive).
 # Jobs with no location ("Unknown Location") are always allowed through.
@@ -114,7 +149,8 @@ log = logging.getLogger("jobwatcher")
 # Deduplication
 # ---------------------------------------------------------------------------
 
-SEEN_MAX_DAYS = 7  # prune job IDs older than this many days
+SEEN_MAX_DAYS = 7        # prune job IDs older than this many days
+COMPANY_COOLDOWN_DAYS = 30  # suppress repeat alerts for the same company
 
 
 def load_seen() -> dict:
@@ -134,6 +170,27 @@ def load_seen() -> dict:
 
 def save_seen(seen: dict) -> None:
     SEEN_FILE.write_text(json.dumps(seen, indent=2))
+
+
+def load_seen_companies() -> dict:
+    """Load alerted companies as {company_key: iso_timestamp}. Prunes entries older than COMPANY_COOLDOWN_DAYS."""
+    if SEEN_COMPANIES_FILE.exists():
+        try:
+            data = json.loads(SEEN_COMPANIES_FILE.read_text())
+            cutoff = (datetime.now() - timedelta(days=COMPANY_COOLDOWN_DAYS)).isoformat()
+            return {k: ts for k, ts in data.items() if ts >= cutoff}
+        except (json.JSONDecodeError, OSError):
+            pass
+    return {}
+
+
+def save_seen_companies(seen_companies: dict) -> None:
+    SEEN_COMPANIES_FILE.write_text(json.dumps(seen_companies, indent=2))
+
+
+def company_key(company: str) -> str:
+    """Normalised company name used as the cooldown key."""
+    return re.sub(r"[^a-z0-9]", "", company.lower())
 
 
 def job_id(row) -> str:
@@ -357,13 +414,16 @@ IMPORTANT RULES:
 - For a tiny startup with 5 employees, revenue might be $0.5M. For a 50-person SaaS company, \
   maybe $5M. Use your judgment.
 - For website, return the most likely company homepage URL you can find in the results
+- For hq_state, return the US state or Canadian province where the company is headquartered \
+  (full name preferred, e.g. "California", "British Columbia"). Return empty string if unknown.
 
 Reply ONLY with this exact JSON:
 {
   "revenue_millions": <number, your best estimate>,
   "employees": <integer, your best estimate>,
   "website": "<homepage URL or empty string if truly not findable>",
-  "revenue_confidence": "high", "medium", or "low"
+  "revenue_confidence": "high", "medium", or "low",
+  "hq_state": "<US state or Canadian province, or empty string>"
 }"""
 
 
@@ -388,7 +448,7 @@ def enrich_company(company: str) -> dict:
                 {"role": "system", "content": ENRICHMENT_SYSTEM},
                 {"role": "user",   "content": user_msg},
             ],
-            max_tokens=120,
+            max_tokens=160,
             temperature=0,
         )
         result = json.loads(resp.choices[0].message.content.strip())
@@ -397,6 +457,8 @@ def enrich_company(company: str) -> dict:
             result["revenue_millions"] = 1.0
         if not result.get("employees"):
             result["employees"] = 10
+        if "hq_state" not in result:
+            result["hq_state"] = ""
     except Exception as e:
         log.warning("OpenAI enrichment failed for %s: %s", company, e)
         result = {"revenue_millions": 1.0, "employees": 10, "website": "", "revenue_confidence": "low"}
@@ -664,9 +726,9 @@ def build_embed(row, ai: dict, enrichment: dict, tier1_hits: list, tier2_hits: l
     }
 
 
-def send_discord(embed: dict) -> None:
+def send_discord(embed: dict, webhook_url: str = DISCORD_WEBHOOK_URL) -> None:
     try:
-        r = requests.post(DISCORD_WEBHOOK_URL, json={"embeds": [embed]}, timeout=10)
+        r = requests.post(webhook_url, json={"embeds": [embed]}, timeout=10)
         r.raise_for_status()
     except requests.RequestException as e:
         log.error("Discord send failed: %s", e)
@@ -678,6 +740,7 @@ def send_discord(embed: dict) -> None:
 def run_search() -> None:
     log.info("--- Starting search run ---")
     seen = load_seen()
+    seen_companies = load_seen_companies()
     seen_this_run: set = set()  # catches dupes across location searches in the same run
     new_count = 0
 
@@ -744,6 +807,12 @@ def run_search() -> None:
                 continue
             log.info("  S1 PASS %s @ %s — %s", title, company, reason)
 
+            # ── Company cooldown check (free) ─────────────────────────────
+            ck = company_key(company)
+            if ck in seen_companies:
+                log.info("  COMPANY COOLDOWN %s @ %s (alerted within %dd)", title, company, COMPANY_COOLDOWN_DAYS)
+                continue
+
             # ── Stage 2: Serper enrichment ────────────────────────────────
             enrichment = enrich_company(company) if company else {"revenue_millions": 1.0, "employees": 10, "website": "", "revenue_confidence": "low"}
             est_revenue = enrichment["revenue_millions"]
@@ -758,6 +827,7 @@ def run_search() -> None:
                 continue
 
             seen[jid] = datetime.now().isoformat()
+            seen_companies[ck] = datetime.now().isoformat()
             new_count += 1
             tier1_hits, tier2_hits = find_keywords(description)
             log.info("  ✓ HIT [%s] %s @ %s | T1:%s T2:%s",
@@ -770,12 +840,17 @@ def run_search() -> None:
                 tier1_hits, tier2_hits, description,
             )
             embed = build_embed(row, ai, enrichment, tier1_hits, tier2_hits)
-            send_discord(embed)
+            if is_west_lead(enrichment, ai):
+                log.info("  → West channel (%s, %s)", enrichment.get("hq_state"), ai.get("industry"))
+                send_discord(embed, WEST_WEBHOOK_URL)
+            else:
+                send_discord(embed)
             time.sleep(0.5)
 
         time.sleep(2)
 
     save_seen(seen)
+    save_seen_companies(seen_companies)
     log.info("--- Run complete. %d new alerts sent. ---", new_count)
 
 # ---------------------------------------------------------------------------
