@@ -128,6 +128,23 @@ THOMAS_LOCATION_SET = {loc.lower() for loc in THOMAS_LOCATIONS} | {
     "maryland", "virginia", "ohio", "indiana", "illinois", "michigan", "wisconsin",
 }
 
+# HQ-based state set for routing (full names + abbreviations)
+THOMAS_STATES = {
+    "maine", "new hampshire", "vermont", "massachusetts", "rhode island",
+    "connecticut", "new york", "pennsylvania", "new jersey", "delaware",
+    "maryland", "virginia", "ohio", "indiana", "illinois", "michigan", "wisconsin",
+    "me", "nh", "vt", "ma", "ri", "ct", "ny", "pa", "nj", "de", "md", "va",
+    "oh", "in", "il", "mi", "wi",
+}
+
+
+def is_thomas_lead(enrichment: dict) -> bool:
+    """Return True if the company HQ is in Thomas's territory."""
+    hq = enrichment.get("hq_state", "").strip().lower()
+    if not hq:
+        return False
+    return any(state in hq for state in THOMAS_STATES)
+
 # Allowed location terms — any job location must contain at least one of these (case-insensitive).
 # Jobs with no location ("Unknown Location") are always allowed through.
 ALLOWED_LOCATIONS = {loc.lower() for loc in US_LOCATIONS + CA_LOCATIONS + THOMAS_LOCATIONS} | {
@@ -769,8 +786,7 @@ def run_search() -> None:
 
     location_list = (
         [("USA", loc) for loc in US_LOCATIONS] +
-        [("Canada", loc) for loc in CA_LOCATIONS] +
-        [("USA", loc) for loc in THOMAS_LOCATIONS]
+        [("Canada", loc) for loc in CA_LOCATIONS]
     )
 
     for country, location in location_list:
@@ -856,13 +872,12 @@ def run_search() -> None:
                 tier1_hits, tier2_hits, description,
             )
             embed = build_embed(row, ai, enrichment, tier1_hits, tier2_hits)
-            job_loc = str(row.get("location") or "").lower()
-            if THOMAS_WEBHOOK_URL and any(t in job_loc for t in THOMAS_LOCATION_SET):
-                log.info("  → Thomas channel (%s)", row.get("location"))
-                send_discord(embed, THOMAS_WEBHOOK_URL)
-            elif is_west_lead(enrichment, ai):
+            if is_west_lead(enrichment, ai):
                 log.info("  → West channel (%s, %s)", enrichment.get("hq_state"), ai.get("industry"))
                 send_discord(embed, WEST_WEBHOOK_URL)
+            elif THOMAS_WEBHOOK_URL and is_thomas_lead(enrichment):
+                log.info("  → Thomas channel (%s)", enrichment.get("hq_state"))
+                send_discord(embed, THOMAS_WEBHOOK_URL)
             else:
                 send_discord(embed)
             time.sleep(0.5)
