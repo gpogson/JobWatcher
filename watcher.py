@@ -43,6 +43,9 @@ if not WEST_WEBHOOK_URL:
 
 THOMAS_WEBHOOK_URL = os.getenv("THOMAS_WEBHOOK_URL")
 
+BRIGHTDATA_API_KEY  = os.getenv("BRIGHTDATA_API_KEY")
+BRIGHTDATA_DATASET  = "gd_m0ci4a4ivx3j5l6nx"
+
 DISCORD_BOT_TOKEN  = os.getenv("DISCORD_BOT_TOKEN")
 DISCORD_CHANNEL_ID = int(os.getenv("DISCORD_CHANNEL_ID", "0"))
 
@@ -388,9 +391,9 @@ def find_keywords(description: str) -> tuple[list[str], list[str]]:
 
 
 # ---------------------------------------------------------------------------
-# Company enrichment (Serper → OpenAI)
-# Returns: revenue_millions (float), employees (int), website (str)
-# AI is never allowed to say unknown — it must always make a best guess.
+# Company enrichment (Serper → Bright Data ZoomInfo scraper)
+# Returns: revenue_millions, employees, website, hq_state, industry, revenue_confidence
+# Falls back to basic Serper+OpenAI if Bright Data fails or no ZoomInfo URL found.
 # ---------------------------------------------------------------------------
 
 def load_company_cache() -> dict:
@@ -409,97 +412,154 @@ def save_company_cache(cache: dict) -> None:
 _company_cache: dict = load_company_cache()
 
 
-def serper_search(query: str) -> list[str]:
-    """Run a Google search via Serper and return a list of result snippets."""
+def serper_find_zoominfo_url(company: str) -> str | None:
+    """Search Google for the company's ZoomInfo profile URL."""
     try:
         r = requests.post(
             "https://google.serper.dev/search",
             headers={"X-API-KEY": SERPER_API_KEY, "Content-Type": "application/json"},
-            json={"q": query, "num": 10},
+            json={"q": f"{company} zoominfo", "num": 5},
             timeout=10,
         )
         r.raise_for_status()
-        data = r.json()
-        snippets = []
-        for item in data.get("organic", []):
-            title   = item.get("title", "")
-            snippet = item.get("snippet", "")
-            link    = item.get("link", "")
-            snippets.append(f"{title}\n{snippet}\n{link}")
-        if data.get("knowledgeGraph"):
-            kg = data["knowledgeGraph"]
-            snippets.insert(0, json.dumps({k: kg.get(k) for k in
-                ("title", "type", "description", "attributes") if kg.get(k)}))
-        return snippets
+        for item in r.json().get("organic", []):
+            link = item.get("link", "")
+            if "zoominfo.com/c/" in link:
+                return link
     except Exception as e:
-        log.warning("Serper search failed for '%s': %s", query, e)
-        return []
+        log.warning("Serper ZoomInfo URL search failed for '%s': %s", company, e)
+    return None
 
 
-ENRICHMENT_SYSTEM = """You are a company research analyst. You will be given Google search \
-results about a company. Extract or estimate the following fields.
+def brightdata_scrape_zoominfo(zoominfo_url: str) -> dict | None:
+    """Trigger a Bright Data ZoomInfo scrape and poll until complete."""
+    if not BRIGHTDATA_API_KEY:
+        return None
+    try:
+        # Trigger async scrape
+        r = requests.post(
+            f"https://api.brightdata.com/datasets/v3/trigger?dataset_id={BRIGHTDATA_DATASET}&format=json",
+            headers={"Authorization": f"Bearer {BRIGHTDATA_API_KEY}", "Content-Type": "application/json"},
+            json={"input": [{"url": zoominfo_url}]},
+            timeout=30,
+        )
+        r.raise_for_status()
+        snapshot_id = r.json().get("snapshot_id")
+        if not snapshot_id:
+            return None
 
-IMPORTANT RULES:
-- You must ALWAYS provide a number for revenue_millions and employees — never null, never "unknown"
-- If you cannot find exact data, make your best estimate based on industry, company size signals, \
-  funding stage, employee count, or any other clues in the results
-- For a tiny startup with 5 employees, revenue might be $0.5M. For a 50-person SaaS company, \
-  maybe $5M. Use your judgment.
-- For website, return the most likely company homepage URL you can find in the results
-- For hq_state, return the US state or Canadian province where the company is headquartered \
-  (full name preferred, e.g. "California", "British Columbia"). Return empty string if unknown.
+        # Poll for results (up to 3 minutes)
+        for _ in range(36):
+            time.sleep(5)
+            poll = requests.get(
+                f"https://api.brightdata.com/datasets/v3/snapshot/{snapshot_id}?format=json",
+                headers={"Authorization": f"Bearer {BRIGHTDATA_API_KEY}"},
+                timeout=30,
+            )
+            if poll.status_code == 200:
+                data = poll.json()
+                if data and isinstance(data, list):
+                    return data[0]
+            elif poll.status_code != 202:
+                log.warning("Bright Data poll error: %s", poll.status_code)
+                return None
+    except Exception as e:
+        log.warning("Bright Data scrape failed for '%s': %s", zoominfo_url, e)
+    return None
 
-Reply ONLY with this exact JSON:
-{
-  "revenue_millions": <number, your best estimate>,
-  "employees": <integer, your best estimate>,
-  "website": "<homepage URL or empty string if truly not findable>",
-  "revenue_confidence": "high", "medium", or "low",
-  "hq_state": "<US state or Canadian province, or empty string>"
-}"""
+
+FALLBACK_ENRICHMENT_SYSTEM = """You are a company research analyst. Given Google search results,
+extract or estimate: revenue_millions (number), employees (integer), website (URL),
+hq_state (US state or Canadian province, full name), revenue_confidence (high/medium/low).
+Always provide numbers — never null. Make best estimates if data is missing.
+Reply ONLY with this JSON:
+{"revenue_millions": <number>, "employees": <integer>, "website": "<url>",
+ "revenue_confidence": "<high|medium|low>", "hq_state": "<state or empty>"}"""
+
+
+def enrich_company_fallback(company: str) -> dict:
+    """Fallback enrichment using Serper snippets + OpenAI when Bright Data unavailable."""
+    try:
+        r = requests.post(
+            "https://google.serper.dev/search",
+            headers={"X-API-KEY": SERPER_API_KEY, "Content-Type": "application/json"},
+            json={"q": f"{company} zoominfo industry revenue", "num": 10},
+            timeout=10,
+        )
+        r.raise_for_status()
+        snippets = [f"{i.get('title','')}\n{i.get('snippet','')}" for i in r.json().get("organic", [])]
+        context = "\n\n---\n\n".join(snippets[:10])
+        resp = openai_client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[
+                {"role": "system", "content": FALLBACK_ENRICHMENT_SYSTEM},
+                {"role": "user", "content": f"Company: {company}\n\nSearch results:\n{context}"},
+            ],
+            max_tokens=160,
+            temperature=0,
+        )
+        result = json.loads(resp.choices[0].message.content.strip())
+    except Exception as e:
+        log.warning("Fallback enrichment failed for %s: %s", company, e)
+        result = {}
+    result.setdefault("revenue_millions", 1.0)
+    result.setdefault("employees", 10)
+    result.setdefault("website", "")
+    result.setdefault("revenue_confidence", "low")
+    result.setdefault("hq_state", "")
+    result.setdefault("industry_enriched", "")
+    return result
 
 
 def enrich_company(company: str) -> dict:
     """
-    Search Google for the company via Serper, feed results to OpenAI,
-    and return revenue_millions, employees, website, revenue_confidence.
+    Enrich a company using Bright Data's ZoomInfo scraper.
+    Falls back to Serper+OpenAI if Bright Data is unavailable or ZoomInfo URL not found.
     Results are cached so each company is only looked up once.
     """
     key = company.strip().lower()
     if key in _company_cache:
         return _company_cache[key]
 
-    all_snippets = serper_search(f"{company} company revenue employees website")
-    context = "\n\n---\n\n".join(all_snippets[:10])
-    user_msg = f"Company: {company}\n\nSearch results:\n{context}"
+    result = None
+    zoominfo_url = serper_find_zoominfo_url(company)
 
-    try:
-        resp = openai_client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[
-                {"role": "system", "content": ENRICHMENT_SYSTEM},
-                {"role": "user",   "content": user_msg},
-            ],
-            max_tokens=160,
-            temperature=0,
-        )
-        result = json.loads(resp.choices[0].message.content.strip())
-        # Ensure revenue and employees are always numbers
-        if not result.get("revenue_millions"):
-            result["revenue_millions"] = 1.0
-        if not result.get("employees"):
-            result["employees"] = 10
-        if "hq_state" not in result:
-            result["hq_state"] = ""
-    except Exception as e:
-        log.warning("OpenAI enrichment failed for %s: %s", company, e)
-        result = {"revenue_millions": 1.0, "employees": 10, "website": "", "revenue_confidence": "low"}
+    if zoominfo_url:
+        log.info("  ZoomInfo URL: %s", zoominfo_url)
+        bd_data = brightdata_scrape_zoominfo(zoominfo_url)
+        if bd_data:
+            industries = bd_data.get("industry") or []
+            industry_str = ", ".join(industries) if isinstance(industries, list) else str(industries)
+            hq = bd_data.get("headquarters") or ""
+            # Extract state from full address string e.g. "123 St, City, California, 90210, United States"
+            hq_state = ""
+            if hq:
+                parts = [p.strip() for p in hq.split(",")]
+                if len(parts) >= 3:
+                    hq_state = parts[-3]
+            result = {
+                "revenue_millions": (bd_data.get("revenue") or 0) / 1_000_000 if bd_data.get("revenue") else 1.0,
+                "employees": bd_data.get("total_employees") or 10,
+                "website": bd_data.get("website") or "",
+                "revenue_confidence": "high" if bd_data.get("revenue") else "low",
+                "hq_state": hq_state,
+                "industry_enriched": industry_str,
+                "tech_stack": [t.get("tech_name", "") for t in (bd_data.get("tech_stack") or [])],
+                "source": "brightdata",
+            }
+            log.info("  [BrightData] '%s': $%.1fM rev, %s employees, %s, %s",
+                     company, result["revenue_millions"], result["employees"],
+                     result["hq_state"], industry_str)
+
+    if not result:
+        log.info("  Falling back to Serper+OpenAI for '%s'", company)
+        result = enrich_company_fallback(company)
+        result["source"] = "fallback"
+        log.info("  [Fallback] '%s': $%.1fM rev, %s employees, %s",
+                 company, result["revenue_millions"], result["employees"], result.get("website", ""))
 
     _company_cache[key] = result
     save_company_cache(_company_cache)
-    log.info("  Enriched '%s': $%.1fM rev, %s employees, %s [%s confidence]",
-             company, result["revenue_millions"], result["employees"],
-             result.get("website", ""), result.get("revenue_confidence", "?"))
     return result
 
 
@@ -716,8 +776,12 @@ def build_embed(row, ai: dict, enrichment: dict, tier1_hits: list, tier2_hits: l
     employees  = enrichment.get("employees", "?")
     website    = enrichment.get("website", "")
     rev_conf   = enrichment.get("revenue_confidence", "low")
+    hq_state   = enrichment.get("hq_state", "")
+    industry_enriched = enrichment.get("industry_enriched", "")
+    tech_stack = enrichment.get("tech_stack", [])
+    enrich_source = enrichment.get("source", "")
 
-    rev_str    = f"~${rev:.1f}M ({rev_conf} confidence)"
+    rev_str = f"${rev:.1f}M" if rev_conf == "high" else f"~${rev:.1f}M ({rev_conf} confidence)"
     company_display = f"[{company}]({website})" if website else company
 
     signals_str = " ".join(f"`{s}`" for s in erp_signals) if erp_signals else "`No signals detected`"
@@ -725,20 +789,28 @@ def build_embed(row, ai: dict, enrichment: dict, tier1_hits: list, tier2_hits: l
     date_str = ""
     if date_post and str(date_post).lower() not in ("nan", "none", "nat", ""):
         date_str = str(date_post)[:10]
-    footer_text = f"Source: {site}  •  {date_str}" if date_str else f"Source: {site}"
+    source_label = f"Source: {site}" + (f"  •  ZoomInfo ✓" if enrich_source == "brightdata" else "")
+    footer_text = f"{source_label}  •  {date_str}" if date_str else source_label
 
     # Tier 1 hits force green regardless of AI confidence
     color = COLOR_HIGH if tier1_hits else CONFIDENCE_COLOR.get(confidence, COLOR_LOW)
 
     fields = [
-        {"name": "📰 Job Posting",  "value": f"[{title}]({job_url})" if job_url else title, "inline": False},
-        {"name": "📍 Location",     "value": location,   "inline": True},
-        {"name": "💰 Revenue Est.", "value": rev_str,    "inline": True},
-        {"name": "👥 Employees",    "value": str(employees), "inline": True},
+        {"name": "📰 Job Posting", "value": f"[{title}]({job_url})" if job_url else title, "inline": False},
+        {"name": "📍 Location",    "value": location, "inline": True},
+        {"name": "💰 Revenue",     "value": rev_str,  "inline": True},
+        {"name": "👥 Employees",   "value": str(employees), "inline": True},
     ]
 
-    if industry:
-        fields.append({"name": "🏭 Industry", "value": industry, "inline": False})
+    if hq_state:
+        fields.append({"name": "🏠 HQ", "value": hq_state, "inline": True})
+
+    display_industry = industry_enriched or industry
+    if display_industry:
+        fields.append({"name": "🏭 Industry", "value": display_industry, "inline": True})
+
+    if tech_stack:
+        fields.append({"name": "🖥️ Tech Stack", "value": ", ".join(tech_stack[:6]), "inline": False})
 
     if tier1_hits:
         fields.append({"name": "🔥 Hot Keywords", "value": " ".join(f"`{kw}`" for kw in tier1_hits), "inline": False})
