@@ -858,35 +858,6 @@ def send_discord(embed: dict) -> None:
         log.error("Discord send failed: %s", e)
 
 
-def send_tam_review(company: str, title: str, job_url: str, enrichment: dict, fail_reason: str) -> None:
-    """Send a review alert when a lead fails the hardcoded TAM check."""
-    rev = enrichment.get("revenue_millions", "?")
-    hq  = enrichment.get("hq_state", "unknown")
-    ind = enrichment.get("industry_enriched", "unknown")
-    src = enrichment.get("source", "?")
-    website = enrichment.get("website", "")
-    company_display = f"[{company}]({website})" if website else company
-
-    embed = {
-        "title": f"🔍 TAM Review Needed — {company_display}",
-        "color": 0xE67E22,  # orange
-        "fields": [
-            {"name": "📰 Job Posting", "value": f"[{title}]({job_url})" if job_url else title, "inline": False},
-            {"name": "❌ Failed Reason", "value": fail_reason, "inline": False},
-            {"name": "🏠 HQ State", "value": hq, "inline": True},
-            {"name": "🏭 ZI Industry", "value": ind, "inline": True},
-            {"name": "💰 Revenue", "value": f"${rev}M", "inline": True},
-            {"name": "📊 Data Source", "value": src, "inline": True},
-        ],
-        "footer": {"text": "If this should be in TAM, update the hardcoded list"},
-        "timestamp": datetime.now(timezone.utc).isoformat(),
-    }
-    try:
-        r = requests.post(DISCORD_WEBHOOK_URL, json={"embeds": [embed]}, timeout=10)
-        r.raise_for_status()
-    except requests.RequestException as e:
-        log.error("TAM review send failed: %s", e)
-
 # ---------------------------------------------------------------------------
 # Core search loop
 # ---------------------------------------------------------------------------
@@ -975,17 +946,19 @@ def run_search() -> None:
                 log.info("  S2 SKIP (revenue ~$%.0fM) %s @ %s", est_revenue, title, company)
                 continue
 
-            # ── Hardcoded TAM check ───────────────────────────────────────
-            in_tam, fail_reason = hardcoded_tam_check(enrichment)
-            if not in_tam:
-                log.info("  TAM SKIP %s @ %s — %s", title, company, fail_reason)
-                send_tam_review(company, title, str(row.get("job_url") or ""), enrichment, fail_reason)
-                continue
-
-            # ── Stage 3: generate metadata (summary, signals, confidence) ─
-            # Stage 3 no longer gates the lead — hardcoded TAM check does.
+            # ── Stage 3: AI TAM verdict + metadata ───────────────────────
             ai = ai_stage3_verdict(title, company, description, enrichment)
-            log.info("  ✓ TAM HIT [%s] %s @ %s", ai.get("confidence", "?"), title, company)
+
+            if not ai.get("is_prospect"):
+                # AI failed it — run hardcoded check as backup
+                in_tam, fail_reason = hardcoded_tam_check(enrichment)
+                if not in_tam:
+                    log.info("  S3+TAM SKIP %s @ %s — AI: %s | Hardcoded: %s",
+                             title, company, ai.get("summary", ""), fail_reason)
+                    continue
+                log.info("  S3 OVERRIDDEN by hardcoded TAM check — %s @ %s", title, company)
+
+            log.info("  ✓ HIT [%s] %s @ %s", ai.get("confidence", "?"), title, company)
 
             seen[jid] = datetime.now().isoformat()
             seen_companies[ck] = datetime.now().isoformat()
