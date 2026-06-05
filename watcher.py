@@ -1058,6 +1058,10 @@ def main() -> None:
     log.info("JobWatcher starting. Interval: every %dh. %d US + %d CA locations.",
              SEARCH_INTERVAL_HOURS, len(US_LOCATIONS), len(CA_LOCATIONS))
 
+    from dashboard import start_dashboard
+    dashboard_thread = threading.Thread(target=start_dashboard, daemon=True)
+    dashboard_thread.start()
+
     run_search()
 
     bot_thread = threading.Thread(target=run_discord_bot, daemon=True)
