@@ -640,8 +640,11 @@ PASS (is_prospect: true) if ALL THREE match:
 2. Company revenue is under $50M
 3. Company ZoomInfo industry matches the TAM industries above
 
-FAIL (is_prospect: false) if ANY of the above do not match, OR if the company is clearly \
-a staffing firm or recruiter that slipped through.
+FAIL (is_prospect: false) if ANY of the above do not match.
+
+ALWAYS set is_staffing: true if the company is a staffing agency, recruiter, headhunter, \
+executive search firm, or HR services company — regardless of any other criteria. \
+A staffing firm is NEVER a prospect and this flag can never be overridden.
 
 Do NOT require ERP signals to pass — a company in the TAM is always worth alerting on \
 regardless of whether the job posting mentions ERP evaluation.
@@ -649,6 +652,7 @@ regardless of whether the job posting mentions ERP evaluation.
 Reply ONLY with this exact JSON:
 {
   "is_prospect": true or false,
+  "is_staffing": true or false,
   "confidence": "high", "medium", or "low",
   "erp_signals": ["tag1", "tag2"],
   "summary": "2-3 sentences: first describe what the company does and their business model; then describe what their current finance/systems situation appears to be and why a new finance leader could be an ERP opportunity"
@@ -950,7 +954,11 @@ def run_search() -> None:
             ai = ai_stage3_verdict(title, company, description, enrichment)
 
             if not ai.get("is_prospect"):
-                # AI failed it — run hardcoded check as backup
+                # Staffing firm — never override, always skip
+                if ai.get("is_staffing"):
+                    log.info("  STAFFING S3 SKIP %s @ %s", title, company)
+                    continue
+                # AI failed for TAM reasons — run hardcoded check as backup
                 in_tam, fail_reason = hardcoded_tam_check(enrichment)
                 if not in_tam:
                     log.info("  S3+TAM SKIP %s @ %s — AI: %s | Hardcoded: %s",
