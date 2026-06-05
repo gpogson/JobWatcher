@@ -37,11 +37,6 @@ DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL")
 if not DISCORD_WEBHOOK_URL:
     raise RuntimeError("DISCORD_WEBHOOK_URL not set in .env")
 
-WEST_WEBHOOK_URL = os.getenv("WEST_WEBHOOK_URL")
-if not WEST_WEBHOOK_URL:
-    raise RuntimeError("WEST_WEBHOOK_URL not set in .env")
-
-THOMAS_WEBHOOK_URL = os.getenv("THOMAS_WEBHOOK_URL")
 
 BRIGHTDATA_API_KEY  = os.getenv("BRIGHTDATA_API_KEY")
 BRIGHTDATA_DATASET  = "gd_m0ci4a4ivx3j5l6nx"
@@ -74,88 +69,63 @@ MAX_REVENUE_MILLION = 50
 SEARCH_INTERVAL_HOURS = 3
 HOURS_OLD = SEARCH_INTERVAL_HOURS + 1
 
-# US states to search
+# US states to search — matched to TAM territory
 US_LOCATIONS = [
-    "Washington State", "Oregon", "Idaho", "Montana",
-    "North Dakota", "South Dakota", "Minnesota", "Nebraska",
-    "Kansas", "Oklahoma", "Colorado", "Wyoming", "New Mexico",
-    "Arizona", "Utah", "Nevada", "California", "Alaska", "Hawaii",
+    "Washington State", "Oregon", "Idaho", "Nevada",
+    "California", "Alaska", "Hawaii", "Utah",
 ]
 
-# Canadian provinces to search
+# Canadian provinces to search — matched to TAM territory
 CA_LOCATIONS = [
-    "Yukon", "Northwest Territories", "British Columbia",
-    "Alberta", "Saskatchewan",
+    "Yukon", "Northwest Territories", "British Columbia", "Manitoba",
 ]
 
-# West territory — company HQ must be in one of these to route to the West channel.
-WEST_STATES = {
-    # Full names
+# TAM territory — company HQ must be in one of these states/provinces.
+TAM_STATES = {
     "alaska", "british columbia", "california", "hawaii", "idaho",
-    "northern mariana islands", "northwest territories", "nunavut",
-    "nevada", "oregon", "utah", "washington", "yukon",
-    # Abbreviations
-    "ak", "bc", "ca", "hi", "id", "mp", "nt", "nu", "nv", "or", "ut", "wa", "yt",
+    "manitoba", "northwest territories", "nunavut", "nevada",
+    "oregon", "utah", "washington", "yukon",
 }
 
-# Industry keywords that qualify a lead for the West channel.
-WEST_INDUSTRIES = [
-    "agriculture", "farming", "livestock", "crop",
-    "manufacturing", "aerospace", "defense", "automotive", "electronics",
-    "furniture", "textiles", "apparel", "chemicals", "industrial",
-    "food", "beverage", "packaged food",
-    "retail", "grocery", "e-commerce", "ecommerce", "wholesale", "distribution",
-    "consumer goods",
-]
-
-
-def is_west_lead(enrichment: dict, ai: dict) -> bool:
-    """Return True if the company HQ is in the West territory AND industry matches."""
-    hq = enrichment.get("hq_state", "").strip().lower()
-    industry = (ai.get("industry") or "").lower()
-    in_west = any(state in hq for state in WEST_STATES) if hq else False
-    in_industry = any(kw in industry for kw in WEST_INDUSTRIES)
-    return in_west and in_industry
-
-
-# Thomas's territory — eastern US states
-THOMAS_LOCATIONS = [
-    "Maine", "New Hampshire", "Vermont", "Massachusetts", "Rhode Island",
-    "Connecticut", "New York", "Pennsylvania", "New Jersey", "Delaware",
-    "Maryland", "Virginia", "Ohio", "Indiana", "Illinois", "Michigan", "Wisconsin",
-]
-
-THOMAS_LOCATION_SET = {loc.lower() for loc in THOMAS_LOCATIONS} | {
-    "maine", "new hampshire", "vermont", "massachusetts", "rhode island",
-    "connecticut", "new york", "pennsylvania", "new jersey", "delaware",
-    "maryland", "virginia", "ohio", "indiana", "illinois", "michigan", "wisconsin",
+# Exact ZoomInfo sub-industry labels that qualify as TAM.
+TAM_INDUSTRIES = {
+    # Agriculture
+    "agriculture", "animals & livestock", "crops",
+    # Business Services
+    "commercial printing",
+    # Manufacturing
+    "hand, power and lawn-care tools", "hand, power & lawn-care tools",
+    "cosmetics, beauty supply & personal care products",
+    "electronics", "health & nutrition products", "pet products",
+    "sporting goods", "toys & games", "watches & jewelry",
+    "food & beverage", "aerospace & defense", "appliances",
+    "automotive parts", "boats & submarines", "building materials",
+    "chemicals & related products", "cleaning products",
+    "computer equipment & peripherals", "furniture", "glass & clay",
+    "household goods", "industrial machinery & equipment", "manufacturing",
+    "motor vehicles", "photographic & optical equipment",
+    "plastic, packaging & containers", "pulp & paper",
+    "telecommunication equipment", "test & measurement equipment",
+    "textiles & apparel", "tires & rubber", "wire & cable",
+    # Retail
+    "apparel & accessories retail", "automobile parts stores",
+    "consumer electronics & computers retail",
+    "convenience stores, gas stations & liquor stores",
+    "department stores, shopping centers & superstores",
+    "flowers, gifts & specialty stores", "furniture retail",
+    "home improvement & hardware retail", "jewelry & watch retail",
+    "office products retail & distribution", "pet products retail",
+    "record, video & book stores", "retail",
+    "sporting & recreational equipment retail", "toys & games retail",
+    "vitamins, supplements & health stores", "grocery retail",
+    "other rental stores (furniture, a/v, construction & industrial equipment)",
 }
 
-# HQ-based state set for routing (full names + abbreviations)
-THOMAS_STATES = {
-    "maine", "new hampshire", "vermont", "massachusetts", "rhode island",
-    "connecticut", "new york", "pennsylvania", "new jersey", "delaware",
-    "maryland", "virginia", "ohio", "indiana", "illinois", "michigan", "wisconsin",
-    "me", "nh", "vt", "ma", "ri", "ct", "ny", "pa", "nj", "de", "md", "va",
-    "oh", "in", "il", "mi", "wi",
-}
-
-
-def is_thomas_lead(enrichment: dict) -> bool:
-    """Return True if the company HQ is in Thomas's territory."""
-    hq = enrichment.get("hq_state", "").strip().lower()
-    if not hq:
-        return False
-    return any(state in hq for state in THOMAS_STATES)
-
-# Allowed location terms — any job location must contain at least one of these (case-insensitive).
-# Jobs with no location ("Unknown Location") are always allowed through.
-ALLOWED_LOCATIONS = {loc.lower() for loc in US_LOCATIONS + CA_LOCATIONS + THOMAS_LOCATIONS} | {
-    # Full name alternates (no abbreviations — too short, cause false matches e.g. "co" in "mexico")
-    "washington", "oregon", "idaho", "montana", "minnesota", "nebraska",
-    "kansas", "oklahoma", "colorado", "wyoming", "nevada", "california",
-    "alaska", "hawaii", "alberta", "saskatchewan", "british columbia",
-    "yukon", "northwest territories",
+# Allowed location terms for job posting pre-filter (no abbreviations — too short, cause false matches)
+ALLOWED_LOCATIONS = {loc.lower() for loc in US_LOCATIONS + CA_LOCATIONS} | {
+    "washington", "oregon", "idaho", "nevada", "california",
+    "alaska", "hawaii", "utah", "british columbia", "manitoba",
+    "yukon", "northwest territories", "nunavut",
 }
 
 def is_allowed_location(location: str) -> bool:
@@ -468,13 +438,17 @@ def brightdata_scrape_zoominfo(zoominfo_url: str) -> dict | None:
     return None
 
 
-FALLBACK_ENRICHMENT_SYSTEM = """You are a company research analyst. Given Google search results,
-extract or estimate: revenue_millions (number), employees (integer), website (URL),
-hq_state (US state or Canadian province, full name), revenue_confidence (high/medium/low).
-Always provide numbers — never null. Make best estimates if data is missing.
+FALLBACK_ENRICHMENT_SYSTEM = """You are a company research analyst. Given Google search results, \
+extract or estimate all fields. You must ALWAYS provide values — never null, never unknown. \
+Make your best guess based on any available signals.
+
+For industry_enriched, use ZoomInfo-style industry labels such as: Manufacturing, Food & Beverage, \
+Building Materials, Agriculture, Retail, Grocery Retail, Electronics, Chemicals & Related Products, etc.
+
 Reply ONLY with this JSON:
 {"revenue_millions": <number>, "employees": <integer>, "website": "<url>",
- "revenue_confidence": "<high|medium|low>", "hq_state": "<state or empty>"}"""
+ "revenue_confidence": "<high|medium|low>", "hq_state": "<US state or Canadian province, full name>",
+ "industry_enriched": "<ZoomInfo-style industry label, your best guess>"}"""
 
 
 def enrich_company_fallback(company: str) -> dict:
@@ -574,19 +548,21 @@ def revenue_over_limit(company: str) -> bool:
 
 STAGE1_SYSTEM = """You are a filter for a NetSuite ERP sales rep.
 
-Your ONLY job is to decide if this job posting is worth researching further. \
-Be generous — if there is any chance it could be a legit ERP prospect, pass it through.
+Your ONLY job is to catch postings that should be immediately rejected. Be very generous — \
+when in doubt, pass it through.
 
-IMMEDIATELY REJECT (return false) if:
-- The hiring company is a staffing agency, recruiter, headhunter, or executive search firm \
-  (Robert Half, Kforce, Randstad, Vaco, CyberCoders, Michael Page, etc.)
-- The posting is for a "client" — the real employer is hidden
-- The role is purely bookkeeping, accounts payable, or payroll with no systems scope
-- The company is clearly a large enterprise (publicly traded, thousands of employees)
+REJECT (return false) ONLY if:
+- The posting is clearly from a staffing agency, recruiter, headhunter, or executive search firm — \
+  look for hidden "client" language, phrases like "our client is looking for", "placed at our client", \
+  "on behalf of our client", or company names that are clearly staffing firms not caught by the blocklist
+- The company is clearly a massive enterprise: Fortune 500, publicly traded with thousands of employees, \
+  a well-known large corporation — these are never NetSuite prospects
 
-PASS THROUGH (return true) if:
-- Role is Controller, CFO, "Chief Financial Officer", or "Fractional CFO"
-- There is a mention of QuickBooks, ERP, NetSuite, or improving finance operations, evaluating current systems
+ALWAYS PASS (return true):
+- Any finance leadership role (Controller, CFO, VP Finance, Director of Finance, etc.) at a company \
+  that could plausibly be small or mid-sized
+- Do NOT reject based on missing ERP signals — a new CFO at any small company is a valid prospect \
+  even if the posting never mentions ERP or QuickBooks
 
 Reply ONLY with this JSON:
 {
@@ -620,27 +596,35 @@ def ai_stage1_filter(title: str, company: str, description: str) -> tuple[bool, 
 # Stage 3 — Final AI verdict (job text + enrichment data)
 # ---------------------------------------------------------------------------
 
-STAGE3_SYSTEM = """You are a senior sales intelligence analyst for a NetSuite ERP sales rep \
-targeting companies with $1M–$15M in annual revenue.
+STAGE3_SYSTEM = """You are a senior sales intelligence analyst for a NetSuite ERP sales rep. \
+Your job is to make a final TAM qualification decision using ZoomInfo enrichment data.
 
-You will receive a job posting AND enriched company data (revenue estimate, employee count, \
-website, industry). Make a final call on whether this company is a strong NetSuite prospect.
+The rep's TAM (Total Addressable Market) is:
+- HQ States/Provinces: Alaska, British Columbia, California, Hawaii, Idaho, Manitoba, \
+  Northwest Territories, Nunavut, Nevada, Oregon, Utah, Washington, Yukon
+- Revenue: under $50M
+- ZoomInfo Industries: Agriculture, Animals & Livestock, Crops, Commercial Printing, \
+  Manufacturing (all sub-types including Food & Beverage, Aerospace & Defense, Building Materials, \
+  Chemicals, Electronics, Industrial Machinery, Automotive Parts, Textiles, Furniture, etc.), \
+  Retail (all sub-types including Grocery, Apparel, Hardware, Sporting Goods, etc.)
 
-A strong prospect:
-- Is a real end-user company (not a staffing firm or recruiter)
-- Has estimated revenue under $15M
-- The job posting signals ERP pain: outgrowing current software, implementing new systems, \
-  mentions of QuickBooks/Sage/Xero/spreadsheets, scaling finance team, Series A/B, \
-  audit readiness, month-end close challenges
-- Is hiring a Controller or CFO — a decision-maker who would buy or champion NetSuite
+PASS (is_prospect: true) if ALL THREE match:
+1. Company HQ is in one of the TAM states/provinces above
+2. Company revenue is under $50M
+3. Company ZoomInfo industry matches the TAM industries above
+
+FAIL (is_prospect: false) if ANY of the above do not match, OR if the company is clearly \
+a staffing firm or recruiter that slipped through.
+
+Do NOT require ERP signals to pass — a company in the TAM is always worth alerting on \
+regardless of whether the job posting mentions ERP evaluation.
 
 Reply ONLY with this exact JSON:
 {
   "is_prospect": true or false,
   "confidence": "high", "medium", or "low",
-  "industry": "short label e.g. SaaS, E-commerce, Manufacturing",
   "erp_signals": ["tag1", "tag2"],
-  "summary": "2-3 sentences: first, describe what the company does and their business model; then describe what their current finance/systems pain point appears to be based on the posting"
+  "summary": "2-3 sentences: first describe what the company does and their business model; then describe what their current finance/systems situation appears to be and why a new finance leader could be an ERP opportunity"
 }
 
 For erp_signals use only: "QuickBooks User", "ERP Migration", "Rapid Growth", "Series A/B", \
@@ -649,18 +633,20 @@ For erp_signals use only: "QuickBooks User", "ERP Migration", "Rapid Growth", "S
 
 
 def ai_stage3_verdict(title: str, company: str, description: str, enrichment: dict) -> dict:
-    """Final verdict using job text + enrichment data."""
+    """Final TAM qualification using ZoomInfo enrichment data."""
     desc_snippet = (description or "")[:2500]
     enrich_str = (
-        f"Revenue estimate: ~${enrichment.get('revenue_millions', '?')}M "
+        f"Revenue: ${enrichment.get('revenue_millions', '?')}M "
         f"({enrichment.get('revenue_confidence', '?')} confidence)\n"
         f"Employees: {enrichment.get('employees', '?')}\n"
+        f"HQ State/Province: {enrichment.get('hq_state', 'unknown')}\n"
+        f"ZoomInfo Industry: {enrichment.get('industry_enriched', 'unknown')}\n"
         f"Website: {enrichment.get('website', 'unknown')}\n"
-        f"Industry (from web): {enrichment.get('industry_web', '')}"
+        f"Data source: {enrichment.get('source', 'unknown')}"
     )
     user_msg = (
         f"Job Title: {title}\nCompany: {company}\n\n"
-        f"--- Company Enrichment ---\n{enrich_str}\n\n"
+        f"--- ZoomInfo Enrichment ---\n{enrich_str}\n\n"
         f"--- Job Description ---\n{desc_snippet}"
     )
     try:
@@ -670,13 +656,13 @@ def ai_stage3_verdict(title: str, company: str, description: str, enrichment: di
                 {"role": "system", "content": STAGE3_SYSTEM},
                 {"role": "user",   "content": user_msg},
             ],
-            max_tokens=300,
+            max_tokens=350,
             temperature=0,
         )
         return json.loads(resp.choices[0].message.content.strip())
     except Exception as e:
         log.warning("Stage3 verdict failed for %s @ %s: %s", title, company, e)
-        return {"is_prospect": False, "confidence": "low", "industry": "", "erp_signals": [], "summary": "Evaluation error."}
+        return {"is_prospect": False, "confidence": "low", "erp_signals": [], "summary": "Evaluation error."}
 
 # ---------------------------------------------------------------------------
 # Digest log — tracks every flagged company for scheduled CSV summaries
@@ -830,9 +816,9 @@ def build_embed(row, ai: dict, enrichment: dict, tier1_hits: list, tier2_hits: l
     }
 
 
-def send_discord(embed: dict, webhook_url: str = DISCORD_WEBHOOK_URL) -> None:
+def send_discord(embed: dict) -> None:
     try:
-        r = requests.post(webhook_url, json={"embeds": [embed]}, timeout=10)
+        r = requests.post(DISCORD_WEBHOOK_URL, json={"embeds": [embed]}, timeout=10)
         r.raise_for_status()
     except requests.RequestException as e:
         log.error("Discord send failed: %s", e)
@@ -860,6 +846,7 @@ def run_search() -> None:
         [("USA", loc) for loc in US_LOCATIONS] +
         [("Canada", loc) for loc in CA_LOCATIONS]
     )
+
 
     for country, location in location_list:
         log.info("Searching %s, %s …", location, country)
@@ -944,14 +931,7 @@ def run_search() -> None:
                 tier1_hits, tier2_hits, description,
             )
             embed = build_embed(row, ai, enrichment, tier1_hits, tier2_hits)
-            if is_west_lead(enrichment, ai):
-                log.info("  → West channel (%s, %s)", enrichment.get("hq_state"), ai.get("industry"))
-                send_discord(embed, WEST_WEBHOOK_URL)
-            elif THOMAS_WEBHOOK_URL and is_thomas_lead(enrichment):
-                log.info("  → Thomas channel (%s)", enrichment.get("hq_state"))
-                send_discord(embed, THOMAS_WEBHOOK_URL)
-            else:
-                send_discord(embed)
+            send_discord(embed)
             time.sleep(0.5)
 
         time.sleep(2)
