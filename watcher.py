@@ -136,6 +136,30 @@ def is_allowed_location(location: str) -> bool:
     return any(allowed in loc for allowed in ALLOWED_LOCATIONS)
 
 
+def hardcoded_tam_check(enrichment: dict) -> tuple[bool, str]:
+    """
+    Hardcoded TAM gate using ZoomInfo enrichment data.
+    Returns (True, "") if in TAM or data is unknown.
+    Returns (False, reason) if clearly outside TAM.
+    """
+    hq = enrichment.get("hq_state", "").strip().lower()
+    industry_raw = enrichment.get("industry_enriched", "").strip()
+    revenue = enrichment.get("revenue_millions", 0)
+
+    if revenue > MAX_REVENUE_MILLION:
+        return False, f"Revenue ${revenue}M exceeds $50M limit"
+
+    if hq and not any(state in hq for state in TAM_STATES):
+        return False, f"HQ state '{enrichment.get('hq_state')}' not in TAM territory"
+
+    if industry_raw:
+        industry_labels = {label.strip().lower() for label in industry_raw.split(",")}
+        if not industry_labels & TAM_INDUSTRIES:
+            return False, f"Industry '{industry_raw}' not in TAM industries"
+
+    return True, ""
+
+
 # ---------------------------------------------------------------------------
 # Logging
 # ---------------------------------------------------------------------------
@@ -585,7 +609,10 @@ def ai_stage1_filter(title: str, company: str, description: str) -> tuple[bool, 
             max_tokens=60,
             temperature=0,
         )
-        data = json.loads(resp.choices[0].message.content.strip())
+        raw = resp.choices[0].message.content.strip()
+        raw = re.sub(r"^```(?:json)?\s*", "", raw)
+        raw = re.sub(r"\s*```$", "", raw)
+        data = json.loads(raw)
         return bool(data.get("pass")), str(data.get("reason", ""))
     except Exception as e:
         log.warning("Stage1 filter failed for %s @ %s: %s", title, company, e)
@@ -659,7 +686,14 @@ def ai_stage3_verdict(title: str, company: str, description: str, enrichment: di
             max_tokens=350,
             temperature=0,
         )
-        return json.loads(resp.choices[0].message.content.strip())
+        raw = (resp.choices[0].message.content or "").strip()
+        raw = re.sub(r"^```(?:json)?\s*", "", raw)
+        raw = re.sub(r"\s*```$", "", raw)
+        if not raw:
+            log.warning("Stage3 empty response for %s @ %s (finish_reason: %s)",
+                        title, company, resp.choices[0].finish_reason)
+            return {"is_prospect": False, "confidence": "low", "erp_signals": [], "summary": "Empty AI response."}
+        return json.loads(raw)
     except Exception as e:
         log.warning("Stage3 verdict failed for %s @ %s: %s", title, company, e)
         return {"is_prospect": False, "confidence": "low", "erp_signals": [], "summary": "Evaluation error."}
@@ -823,6 +857,36 @@ def send_discord(embed: dict) -> None:
     except requests.RequestException as e:
         log.error("Discord send failed: %s", e)
 
+
+def send_tam_review(company: str, title: str, job_url: str, enrichment: dict, fail_reason: str) -> None:
+    """Send a review alert when a lead fails the hardcoded TAM check."""
+    rev = enrichment.get("revenue_millions", "?")
+    hq  = enrichment.get("hq_state", "unknown")
+    ind = enrichment.get("industry_enriched", "unknown")
+    src = enrichment.get("source", "?")
+    website = enrichment.get("website", "")
+    company_display = f"[{company}]({website})" if website else company
+
+    embed = {
+        "title": f"🔍 TAM Review Needed — {company_display}",
+        "color": 0xE67E22,  # orange
+        "fields": [
+            {"name": "📰 Job Posting", "value": f"[{title}]({job_url})" if job_url else title, "inline": False},
+            {"name": "❌ Failed Reason", "value": fail_reason, "inline": False},
+            {"name": "🏠 HQ State", "value": hq, "inline": True},
+            {"name": "🏭 ZI Industry", "value": ind, "inline": True},
+            {"name": "💰 Revenue", "value": f"${rev}M", "inline": True},
+            {"name": "📊 Data Source", "value": src, "inline": True},
+        ],
+        "footer": {"text": "If this should be in TAM, update the hardcoded list"},
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    }
+    try:
+        r = requests.post(DISCORD_WEBHOOK_URL, json={"embeds": [embed]}, timeout=10)
+        r.raise_for_status()
+    except requests.RequestException as e:
+        log.error("TAM review send failed: %s", e)
+
 # ---------------------------------------------------------------------------
 # Core search loop
 # ---------------------------------------------------------------------------
@@ -911,11 +975,17 @@ def run_search() -> None:
                 log.info("  S2 SKIP (revenue ~$%.0fM) %s @ %s", est_revenue, title, company)
                 continue
 
-            # ── Stage 3: final AI verdict with enrichment data ────────────
-            ai = ai_stage3_verdict(title, company, description, enrichment)
-            if not ai.get("is_prospect"):
-                log.info("  S3 SKIP %s @ %s — %s", title, company, ai.get("summary", ""))
+            # ── Hardcoded TAM check ───────────────────────────────────────
+            in_tam, fail_reason = hardcoded_tam_check(enrichment)
+            if not in_tam:
+                log.info("  TAM SKIP %s @ %s — %s", title, company, fail_reason)
+                send_tam_review(company, title, str(row.get("job_url") or ""), enrichment, fail_reason)
                 continue
+
+            # ── Stage 3: generate metadata (summary, signals, confidence) ─
+            # Stage 3 no longer gates the lead — hardcoded TAM check does.
+            ai = ai_stage3_verdict(title, company, description, enrichment)
+            log.info("  ✓ TAM HIT [%s] %s @ %s", ai.get("confidence", "?"), title, company)
 
             seen[jid] = datetime.now().isoformat()
             seen_companies[ck] = datetime.now().isoformat()
