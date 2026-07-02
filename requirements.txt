@@ -4,3 +4,4 @@ python-dotenv
 openai
 discord.py
 flask
+psycopg2-binary

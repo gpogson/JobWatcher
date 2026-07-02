@@ -27,6 +27,8 @@ from dotenv import load_dotenv
 from jobspy import scrape_jobs
 from openai import OpenAI
 
+import db
+
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
@@ -983,6 +985,7 @@ def run_search() -> None:
             )
             embed = build_embed(row, ai, enrichment, tier1_hits, tier2_hits)
             send_discord(embed)
+            db.insert_posting(row, ai, enrichment, tier1_hits, tier2_hits)
             time.sleep(0.5)
 
         time.sleep(2)
@@ -1065,6 +1068,8 @@ def run_discord_bot() -> None:
 def main() -> None:
     log.info("JobWatcher starting. Interval: every %dh. %d US + %d CA locations.",
              SEARCH_INTERVAL_HOURS, len(US_LOCATIONS), len(CA_LOCATIONS))
+
+    db.init_db()
 
     from dashboard import start_dashboard
     dashboard_thread = threading.Thread(target=start_dashboard, daemon=True)

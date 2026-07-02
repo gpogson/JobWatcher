@@ -1,28 +1,35 @@
 """
 JobWatcher Dashboard — Flask web UI for monitoring the watcher pipeline.
 Run as a background thread alongside watcher.py.
+
+Two pages:
+  /       Recent Postings — mirrors what's sent to Discord, backed by Postgres.
+  /stats  History stats on alerted leads + live pipeline health (from the log).
 """
 
 import json
 import os
 import re
-import threading
-from datetime import datetime
 from functools import wraps
 from pathlib import Path
 
 from flask import Flask, redirect, render_template_string, request, session
+
+import db
 
 app = Flask(__name__)
 app.secret_key = os.environ.get("DASHBOARD_SECRET", os.urandom(24))
 
 BASE_DIR     = Path(__file__).parent
 LOG_FILE     = BASE_DIR / "watcher.log"
-DIGEST_FILE  = BASE_DIR / "digest_log.json"
 COMPANY_FILE = BASE_DIR / "company_cache.json"
-SEEN_FILE    = BASE_DIR / "seen_jobs.json"
 
 DASHBOARD_PASSWORD = os.environ.get("DASHBOARD_PASSWORD", "jobwatcher")
+
+PER_PAGE = 25
+
+CONFIDENCE_BORDER = {"high": "border-green-500", "medium": "border-yellow-500", "low": "border-gray-700"}
+CONFIDENCE_BADGE  = {"high": "bg-green-500/15 text-green-400", "medium": "bg-yellow-500/15 text-yellow-400", "low": "bg-gray-700 text-gray-300"}
 
 # ---------------------------------------------------------------------------
 # Auth
@@ -38,15 +45,10 @@ def login_required(f):
 
 
 # ---------------------------------------------------------------------------
-# Data helpers
+# Log-based pipeline health (unchanged — feeds the Stats page)
 # ---------------------------------------------------------------------------
 
 def parse_log_stats():
-    if not LOG_FILE.exists():
-        return {}
-
-    lines = LOG_FILE.read_text(errors="replace").splitlines()
-
     s = {
         "runs": 0, "last_run": "—",
         "scraped": 0, "title_skips": 0, "staffing_skips": 0,
@@ -55,6 +57,13 @@ def parse_log_stats():
         "bd_attempts": 0, "bd_successes": 0, "bd_fallbacks": 0,
         "s3_overrides": 0,
     }
+
+    if not LOG_FILE.exists():
+        s["bd_success_rate"] = 0
+        s["hit_rate"] = 0
+        return s
+
+    lines = LOG_FILE.read_text(errors="replace").splitlines()
 
     for line in lines:
         if "--- Starting search run ---" in line:
@@ -90,16 +99,6 @@ def parse_log_stats():
     return s
 
 
-def get_recent_alerts(limit=25):
-    if not DIGEST_FILE.exists():
-        return []
-    try:
-        entries = json.loads(DIGEST_FILE.read_text())
-        return sorted(entries, key=lambda x: x.get("timestamp", ""), reverse=True)[:limit]
-    except Exception:
-        return []
-
-
 def get_log_tail(n=120):
     if not LOG_FILE.exists():
         return ["No log file found."]
@@ -112,6 +111,22 @@ def cache_size():
         return len(json.loads(COMPANY_FILE.read_text())) if COMPANY_FILE.exists() else 0
     except Exception:
         return 0
+
+
+# ---------------------------------------------------------------------------
+# Shared nav
+# ---------------------------------------------------------------------------
+
+def render_nav(active: str) -> str:
+    def tab(href, label, key):
+        cls = (
+            "text-white border-b-2 border-indigo-500"
+            if active == key else
+            "text-gray-400 hover:text-white border-b-2 border-transparent"
+        )
+        return f'<a href="{href}" class="px-1 pb-1 text-sm font-medium transition-colors {cls}">{label}</a>'
+
+    return f'<div class="flex items-center gap-6">{tab("/", "Recent Postings", "postings")}{tab("/stats", "Stats", "stats")}</div>'
 
 
 # ---------------------------------------------------------------------------
@@ -159,14 +174,11 @@ LOGIN_HTML = """
 </html>
 """
 
-DASHBOARD_HTML = """
-<!DOCTYPE html>
-<html lang="en">
-<head>
+PAGE_HEAD = """
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <meta http-equiv="refresh" content="60">
-  <title>JobWatcher Dashboard</title>
+  {% if auto_refresh %}<meta http-equiv="refresh" content="60">{% endif %}
+  <title>JobWatcher — {{ page_title }}</title>
   <script src="https://cdn.tailwindcss.com"></script>
   <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
   <style>
@@ -178,58 +190,177 @@ DASHBOARD_HTML = """
     .log-warn   { color: #fb923c; }
     .log-bd     { color: #a78bfa; }
   </style>
-</head>
-<body class="min-h-screen bg-gray-950 text-gray-100">
+"""
 
-  <!-- Header -->
+PAGE_HEADER = """
   <header class="border-b border-gray-800 bg-gray-900/80 backdrop-blur sticky top-0 z-10">
-    <div class="max-w-7xl mx-auto px-6 py-4 flex items-center justify-between">
-      <div class="flex items-center gap-3">
+    <div class="max-w-7xl mx-auto px-6 py-4 flex items-center justify-between gap-6">
+      <div class="flex items-center gap-3 shrink-0">
         <span class="text-2xl">🎯</span>
         <div>
           <h1 class="text-lg font-bold text-white leading-tight">JobWatcher</h1>
-          <p class="text-xs text-gray-500">Pipeline Dashboard</p>
+          <p class="text-xs text-gray-500">{{ page_title }}</p>
         </div>
       </div>
-      <div class="flex items-center gap-4">
-        <span class="text-xs text-gray-500">Auto-refresh 60s &nbsp;·&nbsp; Last run: <span class="text-gray-300">{{ s.last_run }}</span></span>
-        <a href="/logout" class="text-xs text-gray-500 hover:text-white transition-colors">Sign out</a>
-      </div>
+      {{ nav | safe }}
+      <a href="/logout" class="text-xs text-gray-500 hover:text-white transition-colors shrink-0">Sign out</a>
     </div>
   </header>
+"""
+
+POSTINGS_HTML = """
+<!DOCTYPE html>
+<html lang="en">
+<head>""" + PAGE_HEAD + """</head>
+<body class="min-h-screen bg-gray-950 text-gray-100">
+""" + PAGE_HEADER + """
+
+  <main class="max-w-4xl mx-auto px-6 py-8">
+    {% if not postings %}
+    <div class="text-center py-24 text-gray-600">
+      <p class="text-4xl mb-3">📭</p>
+      {% if not db_configured %}
+      <p class="text-sm">Postgres isn't configured yet — set DATABASE_URL to start storing postings.</p>
+      {% else %}
+      <p class="text-sm">No postings yet. Check back after the next search run.</p>
+      {% endif %}
+    </div>
+    {% else %}
+    <div class="space-y-4">
+      {% for p in postings %}
+      <div class="bg-gray-900 border-l-4 {{ confidence_border.get(p.confidence, 'border-gray-700') }} border-t border-r border-b border-gray-800 rounded-xl p-5">
+        <div class="flex items-start justify-between gap-4">
+          <div class="min-w-0">
+            <h3 class="text-base font-semibold text-white truncate">
+              {% if p.website %}<a href="{{ p.website }}" target="_blank" rel="noopener" class="hover:text-indigo-400">{{ p.company }}</a>{% else %}{{ p.company or "Unknown Company" }}{% endif %}
+            </h3>
+            <p class="text-sm text-gray-300 mt-1">
+              {% if p.job_url %}<a href="{{ p.job_url }}" target="_blank" rel="noopener" class="hover:text-indigo-400 hover:underline">{{ p.title }}</a>{% else %}{{ p.title or "Unknown Title" }}{% endif %}
+            </p>
+          </div>
+          <span class="shrink-0 text-xs font-medium px-2.5 py-1 rounded-full {{ confidence_badge.get(p.confidence, 'bg-gray-700 text-gray-300') }}">{{ (p.confidence or "low")|capitalize }}</span>
+        </div>
+
+        <div class="grid grid-cols-2 sm:grid-cols-4 gap-3 mt-4 text-xs">
+          <div><p class="text-gray-500">Location</p><p class="text-gray-200 mt-0.5">{{ p.location or "Unknown" }}</p></div>
+          <div><p class="text-gray-500">Revenue</p><p class="text-gray-200 mt-0.5">${{ "%.1f"|format(p.revenue_millions or 0) }}M</p></div>
+          <div><p class="text-gray-500">Employees</p><p class="text-gray-200 mt-0.5">{{ p.employees or "?" }}</p></div>
+          {% if p.hq_state %}<div><p class="text-gray-500">HQ</p><p class="text-gray-200 mt-0.5">{{ p.hq_state }}</p></div>{% endif %}
+        </div>
+
+        {% if p.industry %}<p class="text-xs text-gray-500 mt-3">🏭 {{ p.industry }}</p>{% endif %}
+
+        {% if p.tech_stack %}
+        <div class="flex flex-wrap gap-1.5 mt-2">
+          {% for t in p.tech_stack[:6] %}<span class="text-xs bg-gray-800 text-gray-300 px-2 py-0.5 rounded">{{ t }}</span>{% endfor %}
+        </div>
+        {% endif %}
+
+        {% if p.tier1_hits %}
+        <p class="text-xs text-green-400 mt-2">🔥 {% for kw in p.tier1_hits %}<code class="mr-1">{{ kw }}</code>{% endfor %}</p>
+        {% endif %}
+        {% if p.tier2_hits %}
+        <p class="text-xs text-yellow-400 mt-1">⚠️ {% for kw in p.tier2_hits %}<code class="mr-1">{{ kw }}</code>{% endfor %}</p>
+        {% endif %}
+
+        {% if p.erp_signals %}
+        <div class="flex flex-wrap gap-1.5 mt-2">
+          {% for sig in p.erp_signals %}<span class="text-xs bg-indigo-500/10 text-indigo-300 px-2 py-0.5 rounded">{{ sig }}</span>{% endfor %}
+        </div>
+        {% endif %}
+
+        {% if p.summary %}<p class="text-sm text-gray-400 mt-3 leading-relaxed">{{ p.summary }}</p>{% endif %}
+
+        <div class="flex items-center justify-between mt-4 pt-3 border-t border-gray-800 text-xs text-gray-500">
+          <span>{{ p.site }}{% if p.enrich_source == 'brightdata' %} · ZoomInfo ✓{% endif %}</span>
+          <span>{{ p.alerted_at.strftime('%Y-%m-%d %H:%M') if p.alerted_at else '' }}</span>
+        </div>
+      </div>
+      {% endfor %}
+    </div>
+
+    <div class="flex items-center justify-between mt-8">
+      {% if page > 1 %}
+      <a href="/?page={{ page - 1 }}" class="text-sm text-gray-400 hover:text-white transition-colors">← Prev</a>
+      {% else %}<span></span>{% endif %}
+      <span class="text-xs text-gray-500">Page {{ page }} of {{ total_pages }}</span>
+      {% if page < total_pages %}
+      <a href="/?page={{ page + 1 }}" class="text-sm text-gray-400 hover:text-white transition-colors">Next →</a>
+      {% else %}<span></span>{% endif %}
+    </div>
+    {% endif %}
+  </main>
+</body>
+</html>
+"""
+
+STATS_HTML = """
+<!DOCTYPE html>
+<html lang="en">
+<head>""" + PAGE_HEAD + """</head>
+<body class="min-h-screen bg-gray-950 text-gray-100">
+""" + PAGE_HEADER + """
 
   <main class="max-w-7xl mx-auto px-6 py-8 space-y-8">
 
-    <!-- Stats cards -->
+    <!-- Lead history summary -->
     <div class="grid grid-cols-2 md:grid-cols-4 gap-4">
       <div class="bg-gray-900 border border-gray-800 rounded-xl p-5">
-        <p class="text-xs font-medium text-gray-500 uppercase tracking-wider mb-1">Alerts Sent</p>
-        <p class="text-3xl font-bold text-white">{{ s.hits }}</p>
-        <p class="text-xs text-gray-600 mt-1">All time</p>
+        <p class="text-xs font-medium text-gray-500 uppercase tracking-wider mb-1">All-Time Leads</p>
+        <p class="text-3xl font-bold text-white">{{ totals.all_time }}</p>
+        <p class="text-xs text-gray-600 mt-1">Driven to Discord</p>
       </div>
       <div class="bg-gray-900 border border-gray-800 rounded-xl p-5">
-        <p class="text-xs font-medium text-gray-500 uppercase tracking-wider mb-1">Hit Rate</p>
-        <p class="text-3xl font-bold {% if s.hit_rate > 10 %}text-green-400{% else %}text-yellow-400{% endif %}">{{ s.hit_rate }}%</p>
-        <p class="text-xs text-gray-600 mt-1">Of S1 passes</p>
+        <p class="text-xs font-medium text-gray-500 uppercase tracking-wider mb-1">This Week</p>
+        <p class="text-3xl font-bold text-white">{{ totals.this_week }}</p>
+        <p class="text-xs text-gray-600 mt-1">Last 7 days</p>
       </div>
       <div class="bg-gray-900 border border-gray-800 rounded-xl p-5">
-        <p class="text-xs font-medium text-gray-500 uppercase tracking-wider mb-1">BD Success</p>
-        <p class="text-3xl font-bold {% if s.bd_success_rate > 70 %}text-green-400{% elif s.bd_success_rate > 40 %}text-yellow-400{% else %}text-red-400{% endif %}">{{ s.bd_success_rate }}%</p>
-        <p class="text-xs text-gray-600 mt-1">{{ s.bd_successes }}/{{ s.bd_attempts }} lookups</p>
+        <p class="text-xs font-medium text-gray-500 uppercase tracking-wider mb-1">This Month</p>
+        <p class="text-3xl font-bold text-white">{{ totals.this_month }}</p>
+        <p class="text-xs text-gray-600 mt-1">Last 30 days</p>
       </div>
       <div class="bg-gray-900 border border-gray-800 rounded-xl p-5">
-        <p class="text-xs font-medium text-gray-500 uppercase tracking-wider mb-1">Companies Cached</p>
-        <p class="text-3xl font-bold text-white">{{ cache }}</p>
-        <p class="text-xs text-gray-600 mt-1">ZoomInfo lookups saved</p>
+        <p class="text-xs font-medium text-gray-500 uppercase tracking-wider mb-1">Avg Company</p>
+        <p class="text-3xl font-bold text-white">${{ avgs.avg_revenue }}M</p>
+        <p class="text-xs text-gray-600 mt-1">~{{ avgs.avg_employees }} employees</p>
       </div>
     </div>
 
-    <!-- Pipeline funnel + Recent alerts -->
-    <div class="grid grid-cols-1 lg:grid-cols-5 gap-6">
+    <!-- Alerts over time -->
+    <div class="bg-gray-900 border border-gray-800 rounded-xl p-6">
+      <h2 class="text-sm font-semibold text-white mb-5">Alerts Over Time <span class="text-gray-600 font-normal text-xs ml-2">last 60 days</span></h2>
+      {% if chart_labels %}
+      <canvas id="alertsChart" height="70"></canvas>
+      {% else %}
+      <p class="text-xs text-gray-600 py-8 text-center">No history yet.</p>
+      {% endif %}
+    </div>
 
-      <!-- Funnel -->
+    <!-- Breakdowns -->
+    <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-6">
+      <div class="bg-gray-900 border border-gray-800 rounded-xl p-6">
+        <h2 class="text-sm font-semibold text-white mb-4">Confidence</h2>
+        {{ bar_list(confidence_breakdown, "bg-green-400") }}
+      </div>
+      <div class="bg-gray-900 border border-gray-800 rounded-xl p-6">
+        <h2 class="text-sm font-semibold text-white mb-4">Top Industries</h2>
+        {{ bar_list(top_industries, "bg-purple-400") }}
+      </div>
+      <div class="bg-gray-900 border border-gray-800 rounded-xl p-6">
+        <h2 class="text-sm font-semibold text-white mb-4">Top HQ States</h2>
+        {{ bar_list(top_hq_states, "bg-blue-400") }}
+      </div>
+      <div class="bg-gray-900 border border-gray-800 rounded-xl p-6">
+        <h2 class="text-sm font-semibold text-white mb-4">Source</h2>
+        {{ bar_list(source_breakdown, "bg-indigo-400") }}
+      </div>
+    </div>
+
+    <!-- Pipeline health (live, from watcher.log) -->
+    <div class="grid grid-cols-1 lg:grid-cols-5 gap-6">
       <div class="lg:col-span-2 bg-gray-900 border border-gray-800 rounded-xl p-6">
-        <h2 class="text-sm font-semibold text-white mb-5">Pipeline Funnel</h2>
+        <h2 class="text-sm font-semibold text-white mb-5">Pipeline Funnel <span class="text-gray-600 font-normal text-xs ml-2">this run of the log</span></h2>
         <div class="space-y-3">
           {% set funnel = [
             ("Scraped",          s.scraped,         "bg-indigo-500"),
@@ -260,67 +391,81 @@ DASHBOARD_HTML = """
           <div class="text-gray-500">S3 overrides <span class="text-green-400 font-medium float-right">{{ s.s3_overrides }}</span></div>
           <div class="text-gray-500">BD fallbacks <span class="text-yellow-400 font-medium float-right">{{ s.bd_fallbacks }}</span></div>
           <div class="text-gray-500">Staffing blocked <span class="text-red-400 font-medium float-right">{{ s.staffing_skips }}</span></div>
+          <div class="text-gray-500">BD success rate <span class="text-white font-medium float-right">{{ s.bd_success_rate }}%</span></div>
+          <div class="text-gray-500">Companies cached <span class="text-white font-medium float-right">{{ cache }}</span></div>
         </div>
       </div>
 
-      <!-- Recent alerts -->
       <div class="lg:col-span-3 bg-gray-900 border border-gray-800 rounded-xl p-6">
-        <h2 class="text-sm font-semibold text-white mb-5">Recent Alerts</h2>
-        {% if alerts %}
-        <div class="space-y-3 max-h-96 overflow-y-auto pr-1">
-          {% for a in alerts %}
-          <div class="bg-gray-800/60 rounded-lg px-4 py-3 hover:bg-gray-800 transition-colors">
-            <div class="flex items-start justify-between gap-2">
-              <div class="min-w-0">
-                <p class="text-sm font-medium text-white truncate">{{ a.company }}</p>
-                <p class="text-xs text-gray-400 truncate mt-0.5">{{ a.job_title }}</p>
-                {% if a.hot_keywords %}
-                <p class="text-xs text-green-400 mt-1">🔥 {{ a.hot_keywords }}</p>
-                {% endif %}
-                {% if a.legacy_keywords %}
-                <p class="text-xs text-yellow-400">⚠️ {{ a.legacy_keywords }}</p>
-                {% endif %}
-              </div>
-              <div class="text-right shrink-0">
-                <p class="text-xs text-gray-500">{{ a.timestamp[:10] }}</p>
-                {% if a.website %}
-                <a href="{{ a.website }}" target="_blank"
-                   class="text-xs text-indigo-400 hover:text-indigo-300 transition-colors">website ↗</a>
-                {% endif %}
-              </div>
-            </div>
-          </div>
+        <h2 class="text-sm font-semibold text-white mb-4">Live Log <span class="text-gray-600 font-normal text-xs ml-2">last 120 lines</span></h2>
+        <div class="bg-gray-950 rounded-lg p-4 max-h-96 overflow-y-auto">
+          {% for line in log_lines %}
+          <div class="log-line text-xs leading-5
+            {% if '✓ HIT' in line or 'TAM HIT' in line %}log-hit
+            {% elif 'SKIP' in line %}log-skip
+            {% elif 'PASS' in line %}log-pass
+            {% elif 'WARNING' in line or 'ERROR' in line %}log-warn
+            {% elif 'BrightData' in line %}log-bd
+            {% else %}text-gray-500{% endif %}">{{ line }}</div>
           {% endfor %}
         </div>
-        {% else %}
-        <div class="text-center py-12 text-gray-600">
-          <p class="text-4xl mb-3">📭</p>
-          <p class="text-sm">No alerts yet</p>
-        </div>
-        {% endif %}
-      </div>
-    </div>
-
-    <!-- Log tail -->
-    <div class="bg-gray-900 border border-gray-800 rounded-xl p-6">
-      <h2 class="text-sm font-semibold text-white mb-4">Live Log <span class="text-gray-600 font-normal text-xs ml-2">last 120 lines</span></h2>
-      <div class="bg-gray-950 rounded-lg p-4 max-h-96 overflow-y-auto">
-        {% for line in log_lines %}
-        <div class="log-line text-xs leading-5
-          {% if '✓ HIT' in line or 'TAM HIT' in line %}log-hit
-          {% elif 'SKIP' in line %}log-skip
-          {% elif 'PASS' in line %}log-pass
-          {% elif 'WARNING' in line or 'ERROR' in line %}log-warn
-          {% elif 'BrightData' in line %}log-bd
-          {% else %}text-gray-500{% endif %}">{{ line }}</div>
-        {% endfor %}
       </div>
     </div>
 
   </main>
+
+  {% if chart_labels %}
+  <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+  <script>
+    new Chart(document.getElementById('alertsChart'), {
+      type: 'bar',
+      data: {
+        labels: {{ chart_labels | tojson }},
+        datasets: [{
+          label: 'Alerts',
+          data: {{ chart_counts | tojson }},
+          backgroundColor: '#6366f1',
+          borderRadius: 4,
+        }]
+      },
+      options: {
+        responsive: true,
+        plugins: { legend: { display: false } },
+        scales: {
+          x: { grid: { display: false }, ticks: { color: '#6b7280', maxRotation: 0, autoSkip: true, maxTicksLimit: 14 } },
+          y: { beginAtZero: true, ticks: { color: '#6b7280', precision: 0 }, grid: { color: '#1f2937' } }
+        }
+      }
+    });
+  </script>
+  {% endif %}
 </body>
 </html>
 """
+
+BAR_LIST_MACRO = """
+{% macro bar_list(items, color) %}
+  {% if items %}
+  <div class="space-y-2.5">
+    {% for item in items %}
+    <div>
+      <div class="flex justify-between text-xs mb-1">
+        <span class="text-gray-400 truncate">{{ (item.label or "Unknown")|capitalize }}</span>
+        <span class="text-white font-medium">{{ item.count }}</span>
+      </div>
+      <div class="h-1.5 bg-gray-800 rounded-full overflow-hidden">
+        <div class="{{ color }} h-full rounded-full" style="width: {{ (item.count / items[0].count * 100)|int }}%"></div>
+      </div>
+    </div>
+    {% endfor %}
+  </div>
+  {% else %}
+  <p class="text-xs text-gray-600">No data yet.</p>
+  {% endif %}
+{% endmacro %}
+"""
+
+STATS_HTML = BAR_LIST_MACRO + STATS_HTML
 
 
 # ---------------------------------------------------------------------------
@@ -346,11 +491,49 @@ def logout():
 
 @app.route("/")
 @login_required
-def index():
+def postings():
+    try:
+        page = max(int(request.args.get("page", 1)), 1)
+    except (TypeError, ValueError):
+        page = 1
+
+    total = db.count_postings()
+    total_pages = max(-(-total // PER_PAGE), 1)  # ceil div
+    page = min(page, total_pages)
+    offset = (page - 1) * PER_PAGE
+
     return render_template_string(
-        DASHBOARD_HTML,
+        POSTINGS_HTML,
+        page_title="Recent Postings",
+        nav=render_nav("postings"),
+        auto_refresh=False,
+        postings=db.get_recent_postings(limit=PER_PAGE, offset=offset),
+        page=page,
+        total_pages=total_pages,
+        db_configured=bool(db.DATABASE_URL),
+        confidence_border=CONFIDENCE_BORDER,
+        confidence_badge=CONFIDENCE_BADGE,
+    )
+
+
+@app.route("/stats")
+@login_required
+def stats():
+    over_time = db.get_alerts_over_time(60)
+    return render_template_string(
+        STATS_HTML,
+        page_title="Stats",
+        nav=render_nav("stats"),
+        auto_refresh=True,
+        totals=db.get_totals(),
+        chart_labels=[r["day"] for r in over_time],
+        chart_counts=[r["count"] for r in over_time],
+        confidence_breakdown=db.get_confidence_breakdown(),
+        top_industries=db.get_top_industries(),
+        top_hq_states=db.get_top_hq_states(),
+        source_breakdown=db.get_source_breakdown(),
+        avgs=db.get_revenue_employee_avgs(),
         s=parse_log_stats(),
-        alerts=get_recent_alerts(),
         log_lines=get_log_tail(),
         cache=cache_size(),
     )
