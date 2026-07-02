@@ -355,6 +355,41 @@ def is_staffing_firm(company: str, description: str) -> bool:
 
 
 # ---------------------------------------------------------------------------
+# Pre-filter: car dealership blocklist (runs before AI — zero cost)
+# ---------------------------------------------------------------------------
+
+# Known large dealership groups (lowercase, partial match)
+DEALERSHIP_GROUP_NAMES = {
+    "autonation", "carmax", "group 1 automotive", "lithia motors",
+    "sonic automotive", "asbury automotive", "penske automotive",
+    "hendrick automotive", "van tuyl", "ken garff", "larry h miller",
+    "carvana", "vroom", "dch auto group",
+}
+
+# Red-flag words in company name that strongly indicate a car dealership
+DEALERSHIP_NAME_KEYWORDS = [
+    "dealership", "dealer group", "auto group", "automotive group",
+    "auto sales", "car dealer", "auto mall", "motor sales",
+    "automotive dealer", "auto dealer", "used cars", "new car dealer",
+]
+
+
+def is_car_dealership(company: str) -> bool:
+    """Returns True if the posting is from a car dealership."""
+    co = company.lower()
+
+    for name in DEALERSHIP_GROUP_NAMES:
+        if name in co:
+            return True
+
+    for kw in DEALERSHIP_NAME_KEYWORDS:
+        if kw in co:
+            return True
+
+    return False
+
+
+# ---------------------------------------------------------------------------
 # Keyword tiers — deterministic scan (free, no API cost)
 # ---------------------------------------------------------------------------
 
@@ -927,6 +962,11 @@ def run_search() -> None:
                 log.info("  STAFFING SKIP %s @ %s", title, company)
                 continue
 
+            # ── Pre-filter: car dealership blocklist (free) ───────────────
+            if is_car_dealership(company):
+                log.info("  DEALERSHIP SKIP %s @ %s", title, company)
+                continue
+
             # ── Pre-filter: title check (free) ───────────────────────────
             if not is_target_title(title):
                 log.info("  TITLE SKIP %s @ %s", title, company)
@@ -967,8 +1007,6 @@ def run_search() -> None:
                              title, company, ai.get("summary", ""), fail_reason)
                     continue
                 log.info("  S3 OVERRIDDEN by hardcoded TAM check — %s @ %s", title, company)
-
-            log.info("  ✓ HIT [%s] %s @ %s", ai.get("confidence", "?"), title, company)
 
             seen[jid] = datetime.now().isoformat()
             seen_companies[ck] = datetime.now().isoformat()

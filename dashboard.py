@@ -51,7 +51,7 @@ def login_required(f):
 def parse_log_stats():
     s = {
         "runs": 0, "last_run": "—",
-        "scraped": 0, "title_skips": 0, "staffing_skips": 0,
+        "scraped": 0, "title_skips": 0, "staffing_skips": 0, "dealership_skips": 0,
         "s1_skips": 0, "s1_passes": 0,
         "s2_skips": 0, "tam_skips": 0, "hits": 0,
         "bd_attempts": 0, "bd_successes": 0, "bd_fallbacks": 0,
@@ -76,8 +76,9 @@ def parse_log_stats():
             m = re.search(r"Got (\d+) postings", line)
             if m:
                 s["scraped"] += int(m.group(1))
-        elif "TITLE SKIP"    in line: s["title_skips"]    += 1
-        elif "STAFFING SKIP" in line: s["staffing_skips"] += 1
+        elif "TITLE SKIP"      in line: s["title_skips"]      += 1
+        elif "STAFFING SKIP"   in line: s["staffing_skips"]   += 1
+        elif "DEALERSHIP SKIP" in line: s["dealership_skips"] += 1
         elif "S1 SKIP"       in line: s["s1_skips"]       += 1
         elif "S1 PASS"       in line: s["s1_passes"]      += 1
         elif "S2 SKIP"       in line: s["s2_skips"]       += 1
@@ -364,7 +365,7 @@ STATS_HTML = """
         <div class="space-y-3">
           {% set funnel = [
             ("Scraped",          s.scraped,         "bg-indigo-500"),
-            ("Title Filter",     s.scraped - s.title_skips - s.staffing_skips, "bg-indigo-400"),
+            ("Title Filter",     s.scraped - s.title_skips - s.staffing_skips - s.dealership_skips, "bg-indigo-400"),
             ("Stage 1 Pass",     s.s1_passes,       "bg-blue-400"),
             ("After Enrichment", s.s1_passes - s.s2_skips, "bg-violet-400"),
             ("TAM Pass",         s.s1_passes - s.s2_skips - s.tam_skips, "bg-purple-400"),
@@ -391,6 +392,7 @@ STATS_HTML = """
           <div class="text-gray-500">S3 overrides <span class="text-green-400 font-medium float-right">{{ s.s3_overrides }}</span></div>
           <div class="text-gray-500">BD fallbacks <span class="text-yellow-400 font-medium float-right">{{ s.bd_fallbacks }}</span></div>
           <div class="text-gray-500">Staffing blocked <span class="text-red-400 font-medium float-right">{{ s.staffing_skips }}</span></div>
+          <div class="text-gray-500">Dealerships blocked <span class="text-red-400 font-medium float-right">{{ s.dealership_skips }}</span></div>
           <div class="text-gray-500">BD success rate <span class="text-white font-medium float-right">{{ s.bd_success_rate }}%</span></div>
           <div class="text-gray-500">Companies cached <span class="text-white font-medium float-right">{{ cache }}</span></div>
         </div>
